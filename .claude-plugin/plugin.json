@@ -1,6 +1,6 @@
 {
   "name": "scav",
-  "version": "0.4.16",
+  "version": "0.5.0",
   "description": "Aggregator: profiles your Claude + Codex conversations and ingests only the skills, agents, commands, hooks and MCP servers you actually use from your installed plugins",
   "author": {
     "name": "dondoe"
