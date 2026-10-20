@@ -1,0 +1,15 @@
+{
+  "name": "scav",
+  "description": "Local marketplace for Scav, the plugin aggregator",
+  "owner": {
+    "name": "dondoe"
+  },
+  "plugins": [
+    {
+      "name": "scav",
+      "description": "Aggregator: profiles your Claude + Codex conversations and ingests only the plugin components you use",
+      "version": "0.4.16",
+      "source": "./"
+    }
+  ]
+}
