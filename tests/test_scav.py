@@ -707,11 +707,10 @@ def test_github_lists_mcp_and_hook_plugins_as_listing_only_rows(monkeypatch):
         return {"stargazers_count": 3, "pushed_at": "2026-10-01T00:00:00Z"}
     monkeypatch.setattr(scav, "gh_json", fake_gh)
     rows = {r["id"]: r for r in scav.github_entries("browser tools", limit=5)}
-    assert set(rows) == {"gh:o/p:servers.json", "gh:o/p:hooks/hooks.json", "gh:o/q:.mcp.json"}
-    assert [rows[i]["kind"] for i in sorted(rows)] == ["hook", "mcp", "mcp"]
-    assert rows["gh:o/p:servers.json"]["desc"].startswith("runs web: npx web-mcp. Browser tools")
-    assert rows["gh:o/p:hooks/hooks.json"]["desc"].startswith("runs ./check.sh. hooks on Stop")
-    assert rows["gh:o/q:.mcp.json"]["desc"].startswith("runs remote: https://x.dev/mcp")
+    assert set(rows) == {"gh:o/p:servers.json#mcp", "gh:o/p:hooks/hooks.json#hook", "gh:o/q:.mcp.json#mcp"}
+    assert rows["gh:o/p:servers.json#mcp"]["desc"].startswith("runs web: npx web-mcp. Browser tools")
+    assert rows["gh:o/p:hooks/hooks.json#hook"]["desc"].startswith("runs ./check.sh. hooks on Stop")
+    assert rows["gh:o/q:.mcp.json#mcp"]["desc"].startswith("runs remote: https://x.dev/mcp")
     assert all(r["status"] == "github ★3 pushed 2026-10-01, listing only" for r in rows.values())
 
 
@@ -758,7 +757,7 @@ def test_eval_mcp_needs_run_servers_and_writes_no_row_when_the_server_never_conn
         or json.loads(capsys.readouterr().out)
 
     out = run()
-    assert out["notes"]["mcp:pw:browser"].startswith("unevaluated: pass --run-servers") and "npx @acme/browser-mcp" in out["notes"]["mcp:pw:browser"]
+    assert out["notes"]["mcp:pw:browser"].startswith("unevaluated: --run-servers starts") and "npx @acme/browser-mcp" in out["notes"]["mcp:pw:browser"]
     assert out["notes"]["hook:guard:all"].startswith("no verdict") and out["hooks"]["hook:guard:all"] == {"sessions": 0}
     out = run(run_servers=True)
     assert "never connected" in out["notes"]["mcp:pw:browser"] and not scav.eval_history()

@@ -252,8 +252,9 @@ def github_entries(need, limit=8):
                 repos[repo] = None
         return repos[repo]
     def row(repo, path, kind, cname, desc):
-        if status(repo) and not any(r["id"] == f"gh:{repo}:{path}" for r in rows):
-            rows.append({"id": f"gh:{repo}:{path}", "kind": kind, "plugin": repo, "name": cname, "desc": desc,
+        rid = f"gh:{repo}:{path}" + ("" if kind == "skill" else f"#{kind}")  # one plugin.json can declare both
+        if status(repo) and not any(r["id"] == rid for r in rows):
+            rows.append({"id": rid, "kind": kind, "plugin": repo, "name": cname, "desc": desc,
                          "tok": "-", "status": status(repo) + ("" if kind == "skill" else ", listing only")})
     for h in search("filename:SKILL.md", n=limit * 3):
         repo, path = h["repository"]["nameWithOwner"], h["path"]
@@ -1412,7 +1413,8 @@ def eval_components(ids, budget, model=None, judge=None, runs=1, limit=6, days=3
             continue
         if members[0]["kind"] == "mcp" and not run_servers:
             for c in members:
-                notes[c["id"]] = f"unevaluated: pass --run-servers to start it, as you: {server_run(server_config(c))}"
+                notes[c["id"]] = (f"unevaluated: --run-servers starts `{server_run(server_config(c))}` as you and lets "
+                                  "the model call all its tools, including ones that write or send, on your past prompts")
             continue
         screen = (lambda t: answerable(t, tools=members[0]["desc"])) if members[0]["kind"] == "mcp" else None
         cases, skipped = (fixed, 0) if calibrate else build_cases(members[0], keys, tasks, prompts, limit, screen)
