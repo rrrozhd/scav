@@ -11,10 +11,11 @@
   scav.py add ID... [--disable P] pins ids, merges them into the selection, applies
   scav.py add --trial ID...      same, unpinned: the next /scav run drops them if unused
   scav.py find "NEED" [--catalogs] ranks installed components (and uninstalled marketplace plugins) against a need
-  scav.py find "NEED" --github   also searches SKILL.md files on GitHub (read-only)
+  scav.py find "NEED" --github   also searches GitHub for SKILL.md files and MCP/hook plugins (read-only, listing only)
   scav.py fetch OWNER/REPO       shallow-clones a repo into ~/.scav/github; its skills become trial-addable
   scav.py unpin ID...            lets later /scav runs drop them again
-  scav.py eval [--component ID]  scores components against vanilla Claude; history in ~/.scav/evals/
+  scav.py eval [--component ID]  scores components against a placebo skill; history in ~/.scav/evals/
+  scav.py eval --run-servers     also scores MCP servers (starts them, as you) against no server; hooks get usage only
   scav.py eval --calibrate       runs the controls that must pass before prune verdicts count
 """
 import argparse, base64, hashlib, json, math, os, random, re, shutil, statistics, subprocess, sys, time
@@ -73,22 +74,87 @@ def installed_plugins(claude=CLAUDE):
     return out
 
 
-def plugin_config(root, key, default):
+def read_local(path):
+    return path.read_text(errors="ignore") if path.is_file() else None
+
+
+def plugin_config(root, key, default, read=read_local):
     """(mapping, file) for a plugin's hooks ({event: groups}) or MCP servers ({name: config}). plugin.json's `key` wins:
-    a path relative to the plugin root, or an inline object. Otherwise the conventional file, if any."""
+    a path relative to the plugin root, or an inline object. Otherwise the conventional file, if any.
+    `read(path)` returns a file's text or None; github_entries passes one that reads from GitHub."""
     manifest = root / ".claude-plugin/plugin.json"
     try:
-        val, src = json.loads(manifest.read_text()).get(key), manifest
-    except (FileNotFoundError, ValueError):
-        val, src = None, manifest
-    if isinstance(val, str):
-        src = root / val
-        val = json.loads(src.read_text()) if src.exists() else {}
-    elif val is None:
-        src = root / default
-        val = json.loads(src.read_text()) if src.exists() else {}
+        val = json.loads(read(manifest) or "{}").get(key)
+    except ValueError:
+        val = None
+    src = manifest
+    if val is None or isinstance(val, str):
+        src = root / (val or default)
+        try:
+            val = json.loads(read(src) or "{}")
+        except ValueError:
+            val = {}
     # a file wraps the mapping in {"hooks": ...} / {"mcpServers": ...}; an inline object may not
     return (val.get(key, val) if isinstance(val, dict) else {}), src
+
+
+DESC_CAP = 400  # find divides overlap by sqrt(word count), so a long built description would rank itself down
+SCRIPT_RE = re.compile(r"[\w.${}/-]+\.(?:sh|py|js|mjs|cjs|ts|rb|cmd)\b")
+
+
+def plugin_about(root):
+    """(plugin.json description, README lines) for building hook and MCP descriptions."""
+    try:
+        about = json.loads(read_local(root / ".claude-plugin/plugin.json") or "{}").get("description", "")
+    except ValueError:
+        about = ""
+    readme = [re.sub(r"[#*`>|_\[\]]|\(http\S*\)", "", ln).strip() for ln in (read_local(root / "README.md") or "").splitlines()]
+    return about, [ln for ln in readme if ln]
+
+
+def server_run(cfg):
+    """What an MCP server config starts or calls: its command line or URL, as written."""
+    return cfg.get("url") or " ".join([cfg.get("command", ""), *map(str, cfg.get("args", []))]).strip()
+
+
+def mcp_desc(name, cfg, about, readme):
+    """What an MCP server does, from disk only (nothing is started): the command or URL it runs, its plugin's
+    description, and the README lines naming it.
+    shortcut: tool names are not listed, since that needs the server running; add an opt-in launch if find misses."""
+    mentions = [ln[:160] for ln in readme if name.lower() in ln.lower()][:3]
+    run = server_run(cfg).replace("${CLAUDE_PLUGIN_ROOT}/", "")
+    return f"MCP server {name} (runs {run or '-'}): {' '.join([about, *mentions]).strip()}"[:DESC_CAP]
+
+
+def script_comment(path):
+    """The first two comment lines of a hook script, without the shebang."""
+    text = read_local(path) or ""
+    lines = [re.sub(r"^\s*(?:#+|//+|/?\*+)\s?", "", ln).strip() for ln in text.splitlines()[:20]
+             if re.match(r"\s*(?:#(?!!)|//|/?\*)", ln)]
+    return " ".join([ln for ln in lines if ln][:2])
+
+
+def hook_desc(events, about, root, src=None, read=read_local):
+    """What a plugin's hooks do, from disk only: events and matchers, each hook's status message, the scripts it runs
+    and their header comments, the hook file's own description, and the plugin's description."""
+    try:
+        own = json.loads(read(src) or "{}").get("description", "") if src and src.suffix == ".json" else ""
+    except ValueError:
+        own = ""
+    on, said, scripts = [], [], []
+    for event, groups in events.items():
+        matchers = sorted({g.get("matcher") for g in groups if isinstance(g, dict) and g.get("matcher")})
+        on.append(event + (f" ({', '.join(matchers)})" if matchers else ""))
+        for g in groups if isinstance(groups, list) else []:
+            for h in g.get("hooks", []) if isinstance(g, dict) else []:
+                said += [h[k] for k in ("statusMessage", "description") if h.get(k)]
+                for s in SCRIPT_RE.findall(h.get("command", "")):
+                    s = s.replace("${CLAUDE_PLUGIN_ROOT}/", "").replace("$CLAUDE_PLUGIN_ROOT/", "")
+                    if Path(s).name not in scripts:
+                        scripts.append(Path(s).name)
+                        said.append(script_comment(root / s) if read is read_local else "")
+    text = " ".join(dict.fromkeys(x for x in [own, *said] if x))
+    return f"hooks on {', '.join(on)}: {text} Scripts: {', '.join(scripts) or '-'}. {about}"[:DESC_CAP]
 
 
 def scan_plugin(name, pid, root, enabled):
@@ -102,12 +168,13 @@ def scan_plugin(name, pid, root, enabled):
     for kind in ("agent", "command"):
         for f in sorted(root.glob(f"{kind}s/*.md")):
             add(kind, f.stem, f, frontmatter(f.read_text(errors="ignore")).get("description", ""))
-    events, src = plugin_config(root, "hooks", "hooks/hooks.json")
+    events, hsrc = plugin_config(root, "hooks", "hooks/hooks.json")
+    servers, msrc = plugin_config(root, "mcpServers", ".mcp.json")
+    about, readme = plugin_about(root) if events or servers else ("", [])
     if events:
-        add("hook", "all", src, "lifecycle hooks: " + ", ".join(events), tok=0)
-    servers, src = plugin_config(root, "mcpServers", ".mcp.json")
-    for srv in servers:
-        add("mcp", srv, src, "MCP server", tok=0)
+        add("hook", "all", hsrc, hook_desc(events, about, root, hsrc), tok=0)
+    for srv, cfg in servers.items():
+        add("mcp", srv, msrc, mcp_desc(srv, cfg if isinstance(cfg, dict) else {}, about, readme), tok=0)
     return comps
 
 
@@ -153,32 +220,71 @@ def gh_json(args):
     return json.loads(out.stdout)
 
 
+def gh_text(repo, path):
+    """A file's text from GitHub, or None if it is missing or unreadable."""
+    try:
+        return base64.b64decode(gh_json(["api", f"repos/{repo}/contents/{path}"])["content"]).decode(errors="ignore")
+    except (RuntimeError, KeyError, ValueError, TypeError):
+        return None
+
+
 def github_entries(need, limit=8):
-    """SKILL.md files on GitHub matching the need, as find rows. Read-only: nothing is cloned or installed.
-    Each hit's own description is read from its SKILL.md frontmatter; stars and last push are shown as trust signals."""
+    """SKILL.md files, and plugins or .mcp.json files offering MCP servers or hooks, on GitHub matching the need, as find
+    rows. Read-only: nothing is cloned or installed. Descriptions come from each hit's own files; stars and last push
+    are shown as trust signals. MCP and hook rows are listings only: their desc starts with the exact command or URL
+    that would run, for the user to review, and `fetch` never ingests them."""
     words = sorted(set(WORD.findall(need.lower())) - STOP)
     if not words:
         return []
-    hits = gh_json(["search", "code", *words, "filename:SKILL.md", "--limit", str(limit * 3),
-                    "--json", "repository,path"])
     rows, repos = [], {}
-    for h in hits:
-        repo, path = h["repository"]["nameWithOwner"], h["path"]
-        # filename: matches loosely (terraform-skill.md); only a real SKILL.md is loadable after fetch
-        if len(rows) == limit * 2 or Path(path).name != "SKILL.md" or any(r["id"] == f"gh:{repo}:{path}" for r in rows):
-            continue
-        try:
-            raw = gh_json(["api", f"repos/{repo}/contents/{path}"])
-            text = base64.b64decode(raw["content"]).decode(errors="ignore")
-            if repo not in repos:
+    def search(*query, n):
+        try:  # each search on its own: code search allows about 10 a minute, so one may be refused
+            return gh_json(["search", "code", *words, *query, "--limit", str(n), "--json", "repository,path"])
+        except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as e:
+            print(f"github search {' '.join(query)} skipped: {e}", file=sys.stderr)
+            return []
+    def status(repo):
+        if repo not in repos:
+            try:
                 meta = gh_json(["api", f"repos/{repo}"])
                 repos[repo] = f"github ★{meta['stargazers_count']} pushed {meta['pushed_at'][:10]}"
-        except (RuntimeError, KeyError, ValueError):
+            except (RuntimeError, KeyError, ValueError):
+                repos[repo] = None
+        return repos[repo]
+    def row(repo, path, kind, cname, desc):
+        if status(repo) and not any(r["id"] == f"gh:{repo}:{path}" for r in rows):
+            rows.append({"id": f"gh:{repo}:{path}", "kind": kind, "plugin": repo, "name": cname, "desc": desc,
+                         "tok": "-", "status": status(repo) + ("" if kind == "skill" else ", listing only")})
+    for h in search("filename:SKILL.md", n=limit * 3):
+        repo, path = h["repository"]["nameWithOwner"], h["path"]
+        # filename: matches loosely (terraform-skill.md); only a real SKILL.md is loadable after fetch
+        if len(rows) == limit * 2 or Path(path).name != "SKILL.md" or (text := gh_text(repo, path)) is None:
             continue
         fm = frontmatter(text)
-        cname = fm.get("name") or Path(path).parent.name or repo.split("/")[1]
-        rows.append({"id": f"gh:{repo}:{path}", "kind": "skill", "plugin": repo, "name": cname,
-                     "desc": fm.get("description", ""), "tok": "-", "status": repos[repo]})
+        row(repo, path, "skill", fm.get("name") or Path(path).parent.name or repo.split("/")[1], fm.get("description", ""))
+    hits = search("filename:plugin.json", "path:.claude-plugin", n=limit) + search("filename:.mcp.json", n=limit)
+    texts = {}
+    for h in hits:
+        repo, path = h["repository"]["nameWithOwner"], Path(h["path"])
+        if path.name not in ("plugin.json", ".mcp.json"):
+            continue  # filename: also matches .mcp.json.archived
+        root = path.parent.parent if path.name == "plugin.json" else path.parent
+        read = lambda p: texts[(repo, p)] if (repo, p) in texts else texts.setdefault((repo, p), gh_text(repo, str(p)))
+        try:
+            about = json.loads(read(path) or "{}").get("description", "") if path.name == "plugin.json" else ""
+            servers, src = plugin_config(root, "mcpServers", ".mcp.json", read) if path.name == "plugin.json" else \
+                (json.loads(read(path) or "{}").get("mcpServers", {}), path)
+        except (ValueError, AttributeError):
+            continue
+        if isinstance(servers, dict) and servers:
+            runs = "; ".join(f"{k}: {server_run(v)}" for k, v in servers.items() if isinstance(v, dict))
+            row(repo, str(src), "mcp", ",".join(servers), f"runs {runs}. {about}"[:DESC_CAP])
+        events, src = plugin_config(root, "hooks", "hooks/hooks.json", read) if path.name == "plugin.json" else ({}, path)
+        if events:
+            cmds = {h.get("command") for gs in events.values() if isinstance(gs, list) for g in gs if isinstance(g, dict)
+                    for h in g.get("hooks", []) if h.get("command")}
+            row(repo, str(src), "hook", "all", f"runs {'; '.join(sorted(cmds))}. " +
+                hook_desc(events, about, root, src, read))
     return rows
 
 
@@ -215,9 +321,33 @@ def user_text(d):
         i.get("text", "") for i in (content or []) if isinstance(i, dict) and i.get("type") == "text")
 
 
+def mcp_prefix(name):
+    """`mcp__plugin_<plugin>_<server>` for a plugin MCP tool's name, else None."""
+    return name.rsplit("__", 1)[0] if name.startswith("mcp__plugin_") and name.count("__") >= 2 else None
+
+
+HOOK_OUTCOMES = {"hook_success": "ran", "hook_blocking_error": "blocked", "hook_non_blocking_error": "error"}
+
+
+def hook_record(d):
+    """(key, outcome) for a transcript line recording a hook run, else None. The key is `hook:<event>:<command>` with
+    the command as configured, which is how invoked_as names a plugin's hooks. Outcome: ran, output (it printed
+    something, e.g. added context), blocked, or error."""
+    a = d.get("attachment") if d.get("type") == "attachment" else None
+    if not isinstance(a, dict) or a.get("type") not in HOOK_OUTCOMES:
+        return None
+    err = a.get("blockingError")
+    cmd = a.get("command") or (err.get("command") if isinstance(err, dict) else None)
+    if not cmd:
+        return None
+    outcome = HOOK_OUTCOMES[a["type"]]
+    return f"hook:{a.get('hookEvent')}:{cmd}", "output" if outcome == "ran" and str(a.get("stdout", "")).strip() else outcome
+
+
 def parse_claude_line(line, uses, prompts, since=""):
-    """Count Skill/Agent/slash-command invocations and collect user-typed prompts from one transcript line."""
-    if '"tool_use"' not in line and '"user"' not in line:
+    """Count Skill/Agent/slash-command invocations, plugin MCP tool calls and hooks that blocked or printed something,
+    and collect user-typed prompts, from one transcript line."""
+    if '"tool_use"' not in line and '"user"' not in line and '"hook_' not in line:
         return  # cheap prefilter; most lines are tool output
     try:
         d = json.loads(line)
@@ -227,7 +357,10 @@ def parse_claude_line(line, uses, prompts, since=""):
         return  # resumed sessions keep old turns in a recently modified file
     msg = d.get("message") or {}
     content = msg.get("content") if isinstance(msg, dict) else None
-    if d.get("type") == "assistant" and isinstance(content, list):
+    if rec := hook_record(d):
+        # shortcut: a hook that only ran says nothing about reliance; one that blocked or printed acted
+        uses[rec[0]] += rec[1] in ("blocked", "output")
+    elif d.get("type") == "assistant" and isinstance(content, list):
         for item in content:
             if not isinstance(item, dict) or item.get("type") != "tool_use":
                 continue
@@ -236,6 +369,8 @@ def parse_claude_line(line, uses, prompts, since=""):
                 uses[inp["skill"].lstrip("/")] += 1
             elif item.get("name") in ("Agent", "Task") and inp.get("subagent_type"):
                 uses[inp["subagent_type"]] += 1
+            elif prefix := mcp_prefix(str(item.get("name", ""))):
+                uses[prefix] += 1
     elif text := user_text(d):
         m = CMD_RE.search(text)
         if m:
@@ -283,10 +418,29 @@ def codex_skill_reads(path):
 
 
 def invoked_as(c, origin, bare_unique):
-    """Every name c may have been called by: qualified, its Scav alias, or its bare name when no other component shares it."""
-    keys = {f"{c['plugin']}:{c['name']}"} | {k for k, v in origin.items() if v == c["id"]}
+    """Every name c may have been called by: qualified, its Scav alias, or its bare name when no other component shares it.
+    An MCP server is called by its tools' prefix, a plugin's hooks by their (event, command) as configured or as
+    ingested into Scav. Two plugins shipping the same hook command share its keys."""
+    aliases = {k for k, v in origin.items() if v == c["id"]}
+    if c["kind"] == "mcp":
+        return {f"mcp__plugin_{c['plugin']}_{c['name']}"} | aliases
+    if c["kind"] == "hook":
+        return hook_keys(c)
+    keys = {f"{c['plugin']}:{c['name']}"} | aliases
     if bare_unique:
         keys.add(c["name"])
+    return keys
+
+
+def hook_keys(c):
+    keys = set()
+    for event, groups in plugin_config(Path(c["root"]), "hooks", "hooks/hooks.json")[0].items():
+        for g in groups if isinstance(groups, list) else []:
+            for h in g.get("hooks", []) if isinstance(g, dict) else []:
+                if h.get("type") == "command" and h.get("command"):
+                    keys |= {f"hook:{event}:{h['command']}", f"hook:{event}:{ingested_command(h['command'], c['root'])}"}
+                    if h.get("statusMessage"):  # transcripts log a hook's status message in place of its command
+                        keys.add(f"hook:{event}:{h['statusMessage']}")
     return keys
 
 
@@ -383,7 +537,7 @@ def profile(days):
     names = {c["name"] for c in comps}
     summary = {"days": days, "components": len(comps), "unique_prompts": unique,
                "always_on_tokens_enabled": sum(c["tok"] for c in comps if c["enabled"] and c["kind"] in KINDS),
-               "top_uses": dict(uses.most_common(40)),
+               "top_uses": dict([u for u in uses.most_common() if not u[0].startswith("hook:")][:40]),
                # shortcut: uses cover the whole --days window, not just the time since the trial add
                "trials": {c["id"]: c["uses"] for c in comps if c["id"] in load_manifest().get("trial", [])},
                "codex_skills_without_plugin": {k: v for k, v in uses.most_common()
@@ -508,9 +662,9 @@ def apply(selection_path, claude=CLAUDE, dest=None):
                 for g in groups:
                     for h in g.get("hooks", []):
                         if h.get("type") == "command":
-                            # hook scripts that read $CLAUDE_PLUGIN_ROOT must keep seeing their source plugin
-                            h["command"] = f"export CLAUDE_PLUGIN_ROOT='{c['root']}'; " + rewrite(h["command"], c["root"], {})
+                            h["command"] = ingested_command(h["command"], c["root"])
                     hooks.setdefault(event, []).append(g)
+            origin[f"hooks.json:{c['plugin']}"] = c["id"]
     if hooks:
         (dest / "hooks").mkdir(exist_ok=True)
         (dest / "hooks/hooks.json").write_text(json.dumps({"hooks": hooks}, indent=2))
@@ -519,10 +673,9 @@ def apply(selection_path, claude=CLAUDE, dest=None):
     servers = {}
     for c in chosen:
         if c["kind"] == "mcp":
-            cfg = plugin_config(Path(c["root"]), "mcpServers", ".mcp.json")[0][c["name"]]
-            cfg = json.loads(rewrite(json.dumps(cfg), c["root"], {}))
-            cfg.setdefault("env", {})["CLAUDE_PLUGIN_ROOT"] = c["root"]
-            servers[c["name"] if c["name"] not in servers else f"{c['plugin']}-{c['name']}"] = cfg
+            n = c["name"] if c["name"] not in servers else f"{c['plugin']}-{c['name']}"
+            servers[n] = server_config(c)
+            origin[f"mcp__plugin_{SELF}_{n}"] = c["id"]  # the prefix its tools are called by, as invoked_as reads it
     if servers:
         (dest / ".mcp.json").write_text(json.dumps({"mcpServers": servers}, indent=2))
         generated.append(".mcp.json")
@@ -538,6 +691,19 @@ def apply(selection_path, claude=CLAUDE, dest=None):
                       "mcp": list(servers), "trial": sorted(trial),
                       "scav_always_on_tokens": sum(comps[i]["tok"] for i in keep if comps[i]["kind"] in KINDS),
                       "warnings": warnings}, indent=2))
+
+
+def ingested_command(cmd, root):
+    # hook scripts that read $CLAUDE_PLUGIN_ROOT must keep seeing their source plugin
+    return f"export CLAUDE_PLUGIN_ROOT='{root}'; " + rewrite(cmd, root, {})
+
+
+def server_config(c):
+    """MCP server c's config with its plugin root filled in, as Scav (or an eval plugin) declares it."""
+    cfg = plugin_config(Path(c["root"]), "mcpServers", ".mcp.json")[0][c["name"]]
+    cfg = json.loads(rewrite(json.dumps(cfg), c["root"], {}))
+    cfg.setdefault("env", {})["CLAUDE_PLUGIN_ROOT"] = c["root"]
+    return cfg
 
 
 def bump_version(dest):
@@ -676,7 +842,7 @@ def find(need, limit=5, catalogs=False, github=False, claude=CLAUDE):
 # once calibration controls on the same model and judge show the instrument separates a known win from a known loss.
 
 EVAL_PLUGIN = "scav-eval"
-EVAL_VERSION = 4  # history rows from another method (vs vanilla, blind judge, rubric, unscreened) don't pool
+EVAL_VERSION = 5  # history rows from another method (vs vanilla, blind judge, rubric, unscreened, pre-MCP) don't pool
 MARGIN = 0.1  # an effect smaller than this is not a win worth its tokens
 MIN_PROMPTS = 4  # distinct prompts a component must have fired on before any verdict
 T95 = [6.314, 2.920, 2.353, 2.132, 2.015, 1.943, 1.895, 1.860, 1.833, 1.812]  # one-sided 95% t, df 1..10
@@ -721,9 +887,10 @@ CONTROLS = {
 
 
 def fired_tasks(days, claude=CLAUDE):
-    """{invoked name: [task, ...]}: what each Skill/Agent/slash-command invocation worked on.
-    A task is {text, standalone, slash, cwd}. An agent works on its brief, a slash command on its arguments, a skill
-    on its args or the user's last prompt. That prompt stands alone only if it opened the session."""
+    """{invoked name: [task, ...]}: what each Skill/Agent/slash-command invocation or plugin MCP tool call worked on,
+    and what each hook run did. A task is {text, standalone, slash, cwd}. An agent works on its brief, a slash command
+    on its arguments, a skill on its args or the user's last prompt, an MCP tool on that prompt. That prompt stands
+    alone only if it opened the session. A hook run (key from hook_record) is {hook: outcome, session}."""
     cutoff = time.time() - days * 86400
     since = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(cutoff))
     out = {}
@@ -735,7 +902,7 @@ def fired_tasks(days, claude=CLAUDE):
         last, opener = "", None
         with open(f, errors="ignore") as fh:
             for line in fh:
-                if '"tool_use"' not in line and '"user"' not in line:
+                if '"tool_use"' not in line and '"user"' not in line and '"hook_' not in line:
                     continue
                 try:
                     d = json.loads(line)
@@ -744,7 +911,9 @@ def fired_tasks(days, claude=CLAUDE):
                 if d.get("timestamp", "") < since:
                     continue
                 cwd = d.get("cwd", "")
-                if text := user_text(d):
+                if rec := hook_record(d):
+                    out.setdefault(rec[0], []).append({"hook": rec[1], "session": d.get("sessionId", f.stem)})
+                elif text := user_text(d):
                     if m := CMD_RE.search(text):
                         a = CMD_ARGS_RE.search(text)
                         add(m.group(1).lstrip("/"), a.group(1).strip() if a else "", True, True, cwd)
@@ -760,6 +929,8 @@ def fired_tasks(days, claude=CLAUDE):
                             name, own = inp["skill"].lstrip("/"), inp.get("args")
                         elif item.get("name") in ("Agent", "Task") and inp.get("subagent_type"):
                             name, own = inp["subagent_type"], inp.get("prompt")
+                        elif name := mcp_prefix(str(item.get("name", ""))):
+                            own = None
                         else:
                             continue
                         add(name, *((own, True) if own else (last, last == opener)), False, cwd)
@@ -857,15 +1028,29 @@ def calibration_prompts(prompts, n, screen=None):
 
 
 def write_case(path, prompt, c, n):
-    """One case in `claude plugin eval` format: a rubric scored in both arms plus a with-only did-it-fire check."""
+    """One case in `claude plugin eval` format: a rubric scored in both arms plus a with-only did-it-fire check.
+    An MCP server fired if the trace has a call to one of its tools, and was up if the run's init line says it
+    connected. Its tools are granted by --allow-tools, not allowed_tools (probed 2.1.304)."""
     tool, field = ("Agent", "subagent_type") if c["kind"] == "agent" else ("Skill", "skill")
     (path / "graders").mkdir(parents=True, exist_ok=True)
     (path / "prompt.md").write_text(
         f"---\nmax_turns: 8\nallowed_tools: [Read, Glob, Grep, Skill, Agent]\nappend_system_prompt: '{NUDGE}'\n---\n\n"
         + prompt + "\n")
-    (path / "graders/fired.md").write_text(
-        f"---\ntype: tool_used\ntool: {tool}\ninput_match: '\"{field}\"\\s*:\\s*\"(?:[\\w-]+:)?{n}\"'\n"
-        "arm: with-only\n---\n")
+    if c["kind"] == "mcp":
+        # tool_used needs an exact tool name; the trace's init line lists tool names bare, a call has "name":
+        (path / "graders/fired.md").write_text(
+            f"---\ntype: regex\ntarget: trace\npattern: '\"name\":\"mcp__plugin_{EVAL_PLUGIN}_{re.escape(n)}__'\n"
+            "arm: with-only\n---\n")
+        (path / "graders/up.md").write_text(
+            f"---\ntype: regex\ntarget: trace\npattern: '\"name\":\"plugin:{EVAL_PLUGIN}:{re.escape(n)}\",\"status\":"
+            "\"connected\"'\narm: with-only\n---\n")
+        # its evidence is the run's trace: pairwise shows the judge the tool results, which otherwise read as invented
+        (path / "graders/trace.md").write_text(
+            "---\ntype: llm\nfocus: trace\narm: with-only\n---\n\nPASS if the trace shows at least one tool call.\n")
+    else:
+        (path / "graders/fired.md").write_text(
+            f"---\ntype: tool_used\ntool: {tool}\ninput_match: '\"{field}\"\\s*:\\s*\"(?:[\\w-]+:)?{n}\"'\n"
+            "arm: with-only\n---\n")
     request = prompt if len(prompt) <= JUDGE_REQUEST_CAP else prompt[:JUDGE_REQUEST_CAP] + "\n[...truncated]"
     for name, criteria in RUBRIC.items():
         (path / f"graders/{name}.md").write_text(
@@ -934,16 +1119,18 @@ def summarize(res, c, run, group, model, judge, explicit):
         src, key = case["name"].split("-", 1)
         per_case[key] = {"src": src, "fired": fired, "with": [r["score"] for r in withs],
                          "without": [r["score"] for r in withouts]}
-    src = Path(c["path"]) / "SKILL.md" if c["kind"] == "skill" else Path(c["path"])
+    src = Path(c["path"]) / "SKILL.md" if c["kind"] == "skill" else Path(c["path"]) if c["kind"] in KINDS else None
     return {"id": c["id"], "run": run, "group": group, "model": model or "default", "judge": judge or "haiku",
             "explicit": explicit, "per_case": per_case, "fired": f"{fired_runs}/{with_runs}",
             "cost_with": mean(cw), "cost_without": mean(cwo), "tok": c["tok"],
-            "invoke_tok": len(src.read_text(errors="ignore")) // 4 if src.exists() else 0,
-            "partial": bool(res.get("partial"))}
+            "invoke_tok": len(src.read_text(errors="ignore")) // 4 if src and src.exists() else 0,
+            "partial": bool(res.get("partial")), "baseline": "no-server" if c["kind"] == "mcp" else "placebo"}
 
 
 PAIR_SYSTEM = ("You compare two answers to one user request. The better answer does what was asked, is specific to "
-               "the request, invents nothing it could not know, and has no padding. Length alone is not quality.")
+               "the request, invents nothing it could not know, and has no padding. Length alone is not quality. "
+               "An answer may come with the tool results it saw; facts taken from those are not invented.")
+TOOL_RESULTS_CAP = 4000
 PAIR_SCHEMA = json.dumps({"type": "object", "properties": {"better": {"enum": ["A", "B", "tie"]}},
                           "required": ["better"]})
 
@@ -975,14 +1162,17 @@ ANSWERABLE_SCHEMA = json.dumps({"type": "object", "properties": {"answerable": {
                                 "required": ["answerable"]})
 
 
-def answerable(prompt, model="sonnet"):
+def answerable(prompt, model="sonnet", tools=""):
     """Can a good answer be written from the request text alone? Cached per prompt in ~/.scav/evals/.
-    Regex catches paths and "this repo"; this catches "our current work", "on my server", "the log below" with none."""
+    Regex catches paths and "this repo"; this catches "our current work", "on my server", "the log below" with none.
+    With `tools` (an MCP server's description), the answer may also use that server, and nothing else local."""
     path = STATE / "evals/answerable.json"
     cache = json.loads(path.read_text()) if path.exists() else {}
-    key = case_key(prompt)
+    key = case_key(tools + prompt)
     if key not in cache:
-        out = claude_json(ANSWERABLE_SYSTEM, f"<request>\n{prompt}\n</request>\n\nCan a good answer be written from "
+        system = ANSWERABLE_SYSTEM + (f" Exception: the assistant can call the tools of this one MCP server, and a "
+                                      f"request that needs only those tools is answerable: {tools}" if tools else "")
+        out = claude_json(system, f"<request>\n{prompt}\n</request>\n\nCan a good answer be written from "
                           "this text alone, without access to anything it refers to?", ANSWERABLE_SCHEMA, model)
         if out is None:
             return False  # unscreened is unusable; not cached, so a later run retries
@@ -997,7 +1187,10 @@ def pairwise(res, judge, ask=ask_judge):
     twice with the order swapped, so a position-biased judge cancels out. +1 with wins both, -1 loses both, 0 split
     or tie. Only runs where the component fired are judged."""
     out = {}
-    answer = lambda r: next((g.get("evidence", "") for g in r.get("graders", []) if g.get("evidence")), "")
+    def answer(r):
+        text = next((g.get("evidence", "") for g in r.get("graders", []) if g.get("evidence") and g["name"] != "trace"), "")
+        seen = tool_results(r)
+        return text + (f"\n\n<tool_results_it_saw>\n{seen[:TOOL_RESULTS_CAP]}\n</tool_results_it_saw>" if seen else "")
     for case in res.get("cases", []):
         withs = [r for r in case.get("arms", {}).get("with", []) if not r.get("error")]
         withouts = [r for r in case.get("arms", {}).get("without", []) if not r.get("error")]
@@ -1009,6 +1202,23 @@ def pairwise(res, judge, ask=ask_judge):
             second = {"A": -1, "B": 1}.get(ask(request, answer(wo), answer(w), judge), 0)
             out.setdefault(case["name"].split("-", 1)[1], []).append((first + second) / 2)
     return out
+
+
+def tool_results(run):
+    """The text of the tool results in a run's trace, read from its `trace` grader's evidence (MCP cases only)."""
+    out = []
+    for ln in next((g.get("evidence") or "" for g in run.get("graders", []) if g.get("name") == "trace"), "").splitlines():
+        try:
+            d = json.loads(ln)
+        except ValueError:
+            continue
+        content = (d.get("message") or {}).get("content") if d.get("type") == "user" else None
+        for item in content if isinstance(content, list) else []:
+            if isinstance(item, dict) and item.get("type") == "tool_result":
+                c = item.get("content")
+                out.append(c if isinstance(c, str) else " ".join(
+                    x.get("text", "") for x in c or [] if isinstance(x, dict) and x.get("text")))
+    return "\n".join(x for x in out if x)
 
 
 def bounds(xs):
@@ -1126,8 +1336,18 @@ def control_component(name, root):
             "root": str(d), "desc": desc, "tok": len(desc) // 4}
 
 
+def hook_report(c, tasks, comps):
+    """What hook component c did in past sessions: runs by outcome (ran, output, blocked, error) and sessions. Other
+    plugins shipping the same command are listed under shared_with: their runs can't be told apart from c's."""
+    keys = hook_keys(c)
+    done = [t for k in keys for t in tasks.get(k, [])]
+    out = {**Counter(t["hook"] for t in done), "sessions": len({t["session"] for t in done})}
+    shared = sorted(o["id"] for o in comps if o["kind"] == "hook" and o["id"] != c["id"] and hook_keys(o) & keys)
+    return {**out, "shared_with": shared} if shared else out
+
+
 def eval_components(ids, budget, model=None, judge=None, runs=1, limit=6, days=365, dry=False, calibrate=False,
-                    claude=CLAUDE):
+                    run_servers=False, claude=CLAUDE):
     comps = {c["id"]: c for c in inventory(claude)}
     origin = load_manifest().get("origin", {})
     run = time.strftime("%Y-%m-%dT%H-%M-%S")
@@ -1147,21 +1367,32 @@ def eval_components(ids, budget, model=None, judge=None, runs=1, limit=6, days=3
         groups.setdefault(f"{comps[i]['kind']}:{comps[i]['name']}", []).append(comps[i])
     placebo = control_component("placebo", out_dir / "controls")
     placebo_runs = runs * (2 if "control:placebo" in ids else 1)  # judged against itself needs twice the runs
-    rows, notes, spent, baselines = [], {}, 0.0, {}
+    rows, notes, spent, baselines, hooks = [], {}, 0.0, {}, {}
 
     def run_alone(c, cases, work, n):
-        """`claude plugin eval` with c as the only plugin and no baseline arm: (result or None, note)."""
+        """`claude plugin eval` with c as the only plugin: (result or None, note). A skill or agent runs with no
+        baseline arm (the placebo is its baseline); an MCP server runs against the no-plugin arm of the same eval,
+        with its real server started and its tools granted."""
         nonlocal spent
         (work / ".claude-plugin").mkdir(parents=True, exist_ok=True)
         (work / ".claude-plugin/plugin.json").write_text(json.dumps({"name": EVAL_PLUGIN, "version": "0.0.0"}))
-        copy_component(c, work, c["name"], {})
+        if c["kind"] == "mcp":
+            (work / ".mcp.json").write_text(json.dumps({"mcpServers": {c["name"]: server_config(c)}}, indent=2))
+        else:
+            copy_component(c, work, c["name"], {})
         for case in cases:
             write_case(work / f"evals/{case['source']}-{case_key(case['prompt'])}", case["prompt"], c, c["name"])
         if dry or spent >= budget:
             return None, "" if dry else "; not run: budget spent"
         raw = work / "result.json"
-        cmd = ["claude", "plugin", "eval", str(work), "--ablation", "none", "--json", str(raw), "--no-publish",
+        cmd = ["claude", "plugin", "eval", str(work), "--json", str(raw), "--no-publish",
                "--trust-plugin", "--threshold", "0", "--runs", str(n), "--max-cost-usd", f"{budget - spent:.2f}"]
+        if c["kind"] == "mcp":
+            print(f"starting MCP server {c['name']} as you: {server_run(server_config(c))}", file=sys.stderr)
+            cmd += ["--ablation", "with-without", "--allow-real-servers",
+                    "--allow-tools", f"mcp__plugin_{EVAL_PLUGIN}_{c['name']}__*"]
+        else:
+            cmd += ["--ablation", "none"]
         cmd += ["--model", model] if model else []
         cmd += ["--judge-model", judge] if judge else []
         p = subprocess.run(cmd, capture_output=True, text=True)
@@ -1173,30 +1404,52 @@ def eval_components(ids, budget, model=None, judge=None, runs=1, limit=6, days=3
 
     for group, members in groups.items():
         keys = set().union(*(invoked_as(c, origin, bare[c["name"]] == 1) for c in members))
-        cases, skipped = (fixed, 0) if calibrate else build_cases(members[0], keys, tasks, prompts, limit)
-        explicit = any(t["slash"] for k in keys for t in tasks.get(k, []))
+        if members[0]["kind"] == "hook":
+            for c in members:
+                notes[c["id"]] = ("no verdict: a hook acts across whole sessions, so there is no single answer to "
+                                  "judge; `hooks` shows what it did in past sessions")
+                hooks[c["id"]] = hook_report(c, tasks, comps.values())
+            continue
+        if members[0]["kind"] == "mcp" and not run_servers:
+            for c in members:
+                notes[c["id"]] = f"unevaluated: pass --run-servers to start it, as you: {server_run(server_config(c))}"
+            continue
+        screen = (lambda t: answerable(t, tools=members[0]["desc"])) if members[0]["kind"] == "mcp" else None
+        cases, skipped = (fixed, 0) if calibrate else build_cases(members[0], keys, tasks, prompts, limit, screen)
+        explicit = any(t.get("slash") for k in keys for t in tasks.get(k, []))
         for c in members:
-            if c["kind"] not in KINDS:
-                notes[c["id"]] = "unevaluated: hooks and MCP servers act across a session, not on one answer"
-                continue
             if not cases:
                 notes[c["id"]] = f"unevaluated: no usable cases ({skipped} fired tasks need local context)"
                 continue
             src = Counter(x["source"] for x in cases)
             notes[c["id"]] = f"{len(cases)} cases {dict(src)}, {skipped} fired tasks skipped as context-dependent"
-            ckey = tuple(sorted(case_key(x["prompt"]) for x in cases))
-            if ckey not in baselines:  # look-alikes and controls on the same prompts share one placebo baseline
-                baselines[ckey] = placebo_baseline(cases, placebo_runs, model, lambda n: run_alone(
-                    placebo, cases, out_dir / f"placebo-{len(baselines)}", n))
-            base, note = baselines[ckey]
-            res, note2 = (base, "") if c["id"] == "control:placebo" else \
-                run_alone(c, cases, out_dir / c["id"].replace(":", "__"), runs)
-            if res is None or base is None:
-                notes[c["id"]] += note2 or note or ("" if dry else "; placebo did not run")
-                continue
-            res = versus_placebo(res, base, runs, own=c["id"] == "control:placebo")
-            rows.append(summarize(res, c, run, group, model, judge, explicit))
-            for k, scores in pairwise(res, judge or "haiku").items():
+            if c["kind"] == "mcp":  # no placebo server exists, so its baseline is the same eval's no-server arm
+                res, note = run_alone(c, cases, out_dir / c["id"].replace(":", "__"), runs)
+                if res is None:
+                    notes[c["id"]] += note
+                    continue
+                if not any(g.get("name") == "up" and g.get("passed") for case in res.get("cases", [])
+                           for r in case.get("arms", {}).get("with", []) for g in r.get("graders", [])):
+                    # an absent server would read as "never fired"; record nothing rather than a false idle
+                    notes[c["id"]] += "; unevaluated: the server never connected in the eval sandbox (it may need " \
+                                      "OAuth, a network, or local state)"
+                    continue
+            else:
+                ckey = tuple(sorted(case_key(x["prompt"]) for x in cases))
+                if ckey not in baselines:  # look-alikes and controls on the same prompts share one placebo baseline
+                    baselines[ckey] = placebo_baseline(cases, placebo_runs, model, lambda n: run_alone(
+                        placebo, cases, out_dir / f"placebo-{len(baselines)}", n))
+                base, note = baselines[ckey]
+                res, note2 = (base, "") if c["id"] == "control:placebo" else \
+                    run_alone(c, cases, out_dir / c["id"].replace(":", "__"), runs)
+                if res is None or base is None:
+                    notes[c["id"]] += note2 or note or ("" if dry else "; placebo did not run")
+                    continue
+                res = versus_placebo(res, base, runs, own=c["id"] == "control:placebo")
+            # a haiku judge took tool-sourced facts for invention even when shown the tool results (probed 2026-10-20)
+            jm = judge or ("sonnet" if c["kind"] == "mcp" else None)
+            rows.append(summarize(res, c, run, group, model, jm, explicit))
+            for k, scores in pairwise(res, jm or "haiku").items():
                 rows[-1]["per_case"][k]["pair"] = scores
             rows[-1]["v"] = EVAL_VERSION
             with open(STATE / "evals/history.jsonl", "a") as fh:
@@ -1207,7 +1460,7 @@ def eval_components(ids, budget, model=None, judge=None, runs=1, limit=6, days=3
     print(json.dumps({"run": run, "dir": str(out_dir), "spent_usd": round(spent, 4),
                       "calibration": {"ok": ok, "detail": why}, "notes": notes,
                       "fired": {r["id"]: r["fired"] for r in rows},
-                      "verdicts": {i: v[i] for i in ids if i in v}}, indent=2))
+                      "verdicts": {i: v[i] for i in ids if i in v}, "hooks": hooks}, indent=2))
 
 
 def main():
@@ -1225,7 +1478,7 @@ def main():
     f.add_argument("need")
     f.add_argument("--limit", type=int, default=5)
     f.add_argument("--catalogs", action="store_true", help="also search known marketplaces' uninstalled plugins")
-    f.add_argument("--github", action="store_true", help="also search SKILL.md files on GitHub (read-only, via gh)")
+    f.add_argument("--github", action="store_true", help="also search GitHub for SKILL.md files and MCP/hook plugins (read-only, via gh)")
     sub.add_parser("fetch", help="shallow-clone a GitHub repo so its skills can be trial-added").add_argument("repo")
     sub.add_parser("unpin").add_argument("ids", nargs="+")
     e = sub.add_parser("eval", help="score components against vanilla Claude via `claude plugin eval`")
@@ -1238,13 +1491,14 @@ def main():
     e.add_argument("--days", type=int, default=365)
     e.add_argument("--dry-run", action="store_true", help="write the cases, run nothing")
     e.add_argument("--calibrate", action="store_true", help="run the placebo/saboteur/partial controls instead (each vs the placebo)")
+    e.add_argument("--run-servers", action="store_true", help="evaluate MCP servers: starts each one's real server, as you")
     args = ap.parse_args()
     {"profile": lambda: profile(args.days), "apply": lambda: apply(args.selection), "restore": restore,
      "list": lambda: list_plugin(args.plugin), "add": lambda: add(args.ids, args.disable, trial=args.trial),
      "find": lambda: find(args.need, args.limit, args.catalogs, args.github), "fetch": lambda: fetch(args.repo),
      "unpin": lambda: unpin(args.ids),
      "eval": lambda: eval_components(args.component, args.max_cost_usd, args.model, args.judge_model, args.runs,
-                                     args.cases, args.days, args.dry_run, args.calibrate)}[args.cmd]()
+                                     args.cases, args.days, args.dry_run, args.calibrate, args.run_servers)}[args.cmd]()
 
 
 if __name__ == "__main__":

@@ -492,6 +492,9 @@ def test_hooks_and_mcp_declared_in_plugin_json_are_found_and_applied(tmp_path, m
     cmd = json.loads((dest / "hooks/hooks.json").read_text())["hooks"]["SessionStart"][0]["hooks"][0]["command"]
     assert cmd == f"export CLAUDE_PLUGIN_ROOT='{p}'; node {p}/h.js"
     assert json.loads((dest / ".mcp.json").read_text())["mcpServers"]["srv"]["command"] == f"{p}/s"
+    # held hooks and servers are in origin, so find shows them in-scav and eval picks them by default
+    origin = json.loads((tmp_path / "state/manifest.json").read_text())["origin"]
+    assert origin == {"hooks.json:p": "hook:p:all", "mcp__plugin_scav_srv": "mcp:p:srv"}
 
 
 def test_stats_history_only_pools_rows_from_the_current_method(tmp_path, monkeypatch):
@@ -607,3 +610,160 @@ def test_synced_plugins_are_inventory_sources_on_unless_disabled(tmp_path, monke
     rows = {c["id"]: c for c in scav.inventory(claude)}
     assert rows["skill:used:s"]["pid"] == "used@synced" and rows["skill:used:s"]["enabled"]
     assert not rows["skill:off:s"]["enabled"]
+
+
+def mcp_and_hook_plugins(tmp_path):
+    """An installed browser MCP plugin, a guard-hook plugin and a weak-overlap skill, plus a claude dir listing them."""
+    cache, claude = tmp_path / "cache", tmp_path / "claude"
+    pw = make_plugin(cache, "pw", {
+        ".claude-plugin/plugin.json": json.dumps({"name": "pw", "description": "Drive a real browser for end-to-end tests"}),
+        ".mcp.json": json.dumps({"mcpServers": {"browser": {"command": "npx", "args": ["@acme/browser-mcp@1.2"]}}}),
+        "README.md": "# pw\n\nThe `browser` server takes screenshots and fills forms.\n\nUnrelated install notes.\n"})
+    guard = make_plugin(cache, "guard", {
+        ".claude-plugin/plugin.json": json.dumps({"name": "guard", "description": "Safety rails for git"}),
+        "hooks/hooks.json": json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/no-force.sh", "statusMessage": "Checking push..."}]}]}}),
+        "hooks/no-force.sh": "#!/bin/sh\n# Refuse git push --force to protected branches\nexit 0\n"})
+    other = make_plugin(cache, "other", {"skills/mockups/SKILL.md": "---\nname: mockups\ndescription: Design mockups from "
+                                         "screenshots, sketches, wireframes, moodboards, palettes and type scales\n---\n"})
+    (claude / "plugins").mkdir(parents=True)
+    (claude / "plugins/installed_plugins.json").write_text(json.dumps({"plugins": {
+        "pw@m": [{"installPath": str(pw)}], "guard@m": [{"installPath": str(guard)}], "other@m": [{"installPath": str(other)}]}}))
+    return claude, pw, guard
+
+
+def test_find_ranks_mcp_servers_and_hooks_by_what_they_do(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(scav, "STATE", tmp_path / "state")
+    claude, pw, guard = mcp_and_hook_plugins(tmp_path)
+    rows = {c["id"]: c for c in scav.inventory(claude)}
+    mcp, hook = rows["mcp:pw:browser"]["desc"], rows["hook:guard:all"]["desc"]
+    assert mcp.startswith("MCP server browser (runs npx @acme/browser-mcp@1.2): Drive a real browser")
+    assert "takes screenshots and fills forms" in mcp and "install notes" not in mcp  # only README lines naming it
+    assert "PreToolUse (Bash)" in hook and "Checking push..." in hook and "no-force.sh" in hook
+    assert "Refuse git push --force" in hook and "Safety rails for git" in hook
+
+    scav.find("browser screenshots forms", limit=2, claude=claude)
+    assert [r.split("\t")[0] for r in capsys.readouterr().out.splitlines()] == ["mcp:pw:browser", "skill:other:mockups"]
+    scav.find("refuse force push", limit=1, claude=claude)
+    assert capsys.readouterr().out.startswith("hook:guard:all")
+
+
+def test_mcp_calls_and_acting_hooks_count_as_uses_by_plugin_and_scav_names(tmp_path, monkeypatch):
+    monkeypatch.setattr(scav, "STATE", tmp_path / "state")
+    claude, pw, guard = mcp_and_hook_plugins(tmp_path)
+    att = lambda kind, event, **a: line(type="attachment", attachment={"type": kind, "hookEvent": event, **a})
+    ingested = scav.ingested_command("${CLAUDE_PLUGIN_ROOT}/hooks/no-force.sh", str(guard))
+    uses, prompts = Counter(), []
+    for ln in [
+        line(type="assistant", message={"content": [
+            {"type": "tool_use", "name": "mcp__plugin_pw_browser__take_screenshot", "input": {}},
+            {"type": "tool_use", "name": "mcp__plugin_scav_browser__click", "input": {}}]}),
+        att("hook_success", "PreToolUse", command="Checking push...", stdout=""),  # ran, did nothing
+        att("hook_success", "PreToolUse", command=ingested, stdout="note"),
+        att("hook_blocking_error", "PreToolUse", blockingError={"blockingError": "no", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/no-force.sh"}),
+        att("hook_blocking_error", "Stop", blockingError="a bare string names no command"),
+    ]:
+        scav.parse_claude_line(ln, uses, prompts)
+    rows = {c["id"]: c for c in scav.inventory(claude)}
+    origin = {"mcp__plugin_scav_browser": "mcp:pw:browser"}
+    assert scav.uses_for(rows["mcp:pw:browser"], uses, origin, True) == 2
+    assert scav.uses_for(rows["hook:guard:all"], uses, origin, True) == 2  # output + block; a quiet run is not a use
+
+
+def test_hook_report_counts_outcomes_and_names_plugins_sharing_the_command(tmp_path, monkeypatch):
+    monkeypatch.setattr(scav, "STATE", tmp_path / "state")
+    claude, pw, guard = mcp_and_hook_plugins(tmp_path)
+    twin = make_plugin(tmp_path / "cache", "twin", {"hooks/hooks.json": (guard / "hooks/hooks.json").read_text()})
+    rows = {c["id"]: c for c in scav.inventory(claude)}
+    rows["hook:twin:all"] = scav.scan_plugin("twin", "twin@m", twin, False)[0]
+    key = "hook:PreToolUse:Checking push..."
+    tasks = {key: [{"hook": "ran", "session": "s1"}, {"hook": "blocked", "session": "s1"}, {"hook": "error", "session": "s2"}]}
+    assert scav.hook_report(rows["hook:guard:all"], tasks, rows.values()) == {
+        "ran": 1, "blocked": 1, "error": 1, "sessions": 2, "shared_with": ["hook:twin:all"]}
+
+
+def test_github_lists_mcp_and_hook_plugins_as_listing_only_rows(monkeypatch):
+    import base64 as b64
+    files = {
+        ("o/p", ".claude-plugin/plugin.json"): json.dumps({"name": "p", "description": "Browser tools",
+                                                          "mcpServers": "./servers.json"}),
+        ("o/p", "servers.json"): json.dumps({"mcpServers": {"web": {"command": "npx", "args": ["web-mcp"]}}}),
+        ("o/p", "hooks/hooks.json"): json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "./check.sh"}]}]}}),
+        ("o/q", ".mcp.json"): json.dumps({"mcpServers": {"remote": {"type": "http", "url": "https://x.dev/mcp"}}}),
+    }
+    def fake_gh(args):
+        if args[:2] == ["search", "code"]:
+            if "filename:plugin.json" in args:
+                return [{"repository": {"nameWithOwner": "o/p"}, "path": ".claude-plugin/plugin.json"}]
+            if "filename:.mcp.json" in args:
+                return [{"repository": {"nameWithOwner": "o/q"}, "path": ".mcp.json"},
+                        {"repository": {"nameWithOwner": "o/z"}, "path": ".mcp.json.archived"}]
+            return []
+        if "/contents/" in args[1]:
+            repo, path = args[1][len("repos/"):].split("/contents/")
+            if (repo, path) not in files:
+                raise RuntimeError("HTTP 404")
+            return {"content": b64.b64encode(files[(repo, path)].encode()).decode()}
+        return {"stargazers_count": 3, "pushed_at": "2026-10-01T00:00:00Z"}
+    monkeypatch.setattr(scav, "gh_json", fake_gh)
+    rows = {r["id"]: r for r in scav.github_entries("browser tools", limit=5)}
+    assert set(rows) == {"gh:o/p:servers.json", "gh:o/p:hooks/hooks.json", "gh:o/q:.mcp.json"}
+    assert [rows[i]["kind"] for i in sorted(rows)] == ["hook", "mcp", "mcp"]
+    assert rows["gh:o/p:servers.json"]["desc"].startswith("runs web: npx web-mcp. Browser tools")
+    assert rows["gh:o/p:hooks/hooks.json"]["desc"].startswith("runs ./check.sh. hooks on Stop")
+    assert rows["gh:o/q:.mcp.json"]["desc"].startswith("runs remote: https://x.dev/mcp")
+    assert all(r["status"] == "github ★3 pushed 2026-10-01, listing only" for r in rows.values())
+
+
+def test_mcp_case_checks_a_real_tool_call_and_shows_the_judge_its_tool_results(tmp_path):
+    scav.write_case(tmp_path / "c", "look it up", {"kind": "mcp"}, "browser")
+    g = tmp_path / "c/graders"
+    assert {p.stem for p in g.iterdir()} == {"fired", "up", "trace", *scav.RUBRIC}
+    assert "target: trace" in (g / "fired.md").read_text() and '"name":"mcp__plugin_scav-eval_browser__' in (g / "fired.md").read_text()
+    assert '"status":"connected"' in (g / "up.md").read_text() and "focus: trace" in (g / "trace.md").read_text()
+    trace = "\n".join([json.dumps({"type": "system", "tools": ["mcp__plugin_scav-eval_browser__shot"]}),
+                       json.dumps({"type": "user", "message": {"content": [
+                           {"type": "tool_result", "content": [{"type": "text", "text": "title: Acme"}]}]}}), "not json"])
+    run = {"score": 1, "costUsd": 0.1, "error": None, "graders": [
+        {"name": "done", "evidence": "It is Acme."}, {"name": "fired", "passed": True}, {"name": "trace", "evidence": trace}]}
+    seen = []
+    res = {"cases": [{"name": "fired-k", "promptMarkdown": "q", "arms": {"with": [run], "without": [judged("No idea.")]}}]}
+    scav.pairwise(res, "sonnet", ask=lambda r, a, b, j: seen.append(a) or "A")
+    assert seen[0] == "It is Acme.\n\n<tool_results_it_saw>\ntitle: Acme\n</tool_results_it_saw>" and seen[1] == "No idea."
+
+
+def test_eval_mcp_needs_run_servers_and_writes_no_row_when_the_server_never_connected(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(scav, "STATE", tmp_path / "state")
+    claude, pw, guard = mcp_and_hook_plugins(tmp_path)
+    (claude / "projects/p").mkdir(parents=True)
+    ask = "Take a screenshot of the example.com landing page and describe its header"
+    (claude / "projects/p/s.jsonl").write_text("\n".join(json.dumps(x) for x in [
+        {"type": "user", "timestamp": "2026-10-20T00:00:00Z", "sessionId": "s", "message": {"content": ask}},
+        {"type": "assistant", "timestamp": "2026-10-20T00:00:01Z", "message": {"content": [
+            {"type": "tool_use", "name": "mcp__plugin_pw_browser__take_screenshot", "input": {}}]}}]) + "\n")
+    monkeypatch.setattr(scav, "answerable", lambda t, model="sonnet", tools="": "screenshots" in tools)
+    monkeypatch.setattr(scav, "claude_json", lambda sys_, text, *a: {"better": "A" if "<answer_A>\na\n" in text else "B"})
+    up = []
+    def fake_run(cmd, **kw):
+        if cmd[:3] == ["claude", "plugin", "eval"]:
+            assert "--allow-real-servers" in cmd and "mcp__plugin_scav-eval_browser__*" in cmd
+            cases = [{"name": p.name, "promptMarkdown": ask, "arms": {
+                "with": [{"score": 1, "costUsd": 0.1, "error": None, "graders": [
+                    {"name": "done", "evidence": "a"}, {"name": "fired", "passed": True}, {"name": "up", "passed": bool(up)}]}],
+                "without": [judged("b")]}} for p in (Path(cmd[3]) / "evals").iterdir()]
+            Path(cmd[cmd.index("--json") + 1]).write_text(json.dumps({"costUsd": 0.2, "cases": cases}))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    monkeypatch.setattr(scav.subprocess, "run", fake_run)
+    run = lambda **kw: scav.eval_components(["mcp:pw:browser", "hook:guard:all"], 1.0, days=3650, claude=claude, **kw) \
+        or json.loads(capsys.readouterr().out)
+
+    out = run()
+    assert out["notes"]["mcp:pw:browser"].startswith("unevaluated: pass --run-servers") and "npx @acme/browser-mcp" in out["notes"]["mcp:pw:browser"]
+    assert out["notes"]["hook:guard:all"].startswith("no verdict") and out["hooks"]["hook:guard:all"] == {"sessions": 0}
+    out = run(run_servers=True)
+    assert "never connected" in out["notes"]["mcp:pw:browser"] and not scav.eval_history()
+    up.append(1)
+    out = run(run_servers=True)
+    row = scav.eval_history()[-1]
+    assert (row["baseline"], row["judge"], row["fired"]) == ("no-server", "sonnet", "1/1")
+    assert list(row["per_case"].values())[0]["pair"] == [1.0]
