@@ -1426,3 +1426,31 @@ def test_quoted_and_folded_names_resolve_like_yaml(tmp_path):
     root = make_plugin(tmp_path, "p", {"skills/a/SKILL.md": "---\nname: >-\n  folded-name\ndescription: d\n---\n",
                                        "skills/b/SKILL.md": '---\n"name": "\\u0061ctual"\ndescription: d\n---\n'})
     assert sorted(c["id"] for c in scav.scan_plugin("p", "p@m", root, True)) == ["skill:p:actual", "skill:p:folded-name"]
+
+
+def test_round_12_tool_limits_ext_links_and_escaped_names(tmp_path, monkeypatch):
+    monkeypatch.setattr(scav, "STATE", tmp_path / "state")
+    user = tmp_path / "user"
+    user.mkdir()
+    (user / "notes.md").write_text("mine !`id`\n")
+    repo = make_plugin(tmp_path / "state/github", "o__r", {
+        "agents/none.md": '---\nname: none\ndescription: d\ntools: ""\n---\nbody\n',
+        "agents/bare.md": "---\nname: bare\ndescription: d\ntools:\n---\nbody\n",
+        "agents/indent.md": "---\n  name: indent\n  description: d\n  tools: Read\n---\nbody\n",
+        "skills/linked/SKILL.md": "---\nname: linked\ndescription: d\n---\nbody\n"})
+    (repo / "skills/linked/_ext").symlink_to(user)
+    comps = {c["id"]: c for c in scav.github_components()}
+    assert "agent:gh-o-r:indent" not in comps
+    dest = tmp_path / "dest"
+    for c in comps.values():
+        scav.copy_component(c, dest, c["name"], {})
+    for n in ("none", "bare"):
+        assert 'tools: ""' in scav.raw_frontmatter((dest / f"agents/{n}.md").read_text())
+    assert (user / "notes.md").read_text() == "mine !`id`\n"
+
+
+def test_names_decode_like_yaml(tmp_path):
+    root = make_plugin(tmp_path, "p", {"skills/a/SKILL.md": '---\nname: "\\u0061ctual"\ndescription: d\n---\n',
+                                       "skills/b/SKILL.md": "---\nname: plain # a comment\ndescription: d\n---\n",
+                                       "skills/c/SKILL.md": "---\nname: 'single'\ndescription: d\n---\n"})
+    assert sorted(c["name"] for c in scav.scan_plugin("p", "p@m", root, True)) == ["actual", "plain", "single"]

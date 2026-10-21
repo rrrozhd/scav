@@ -217,13 +217,19 @@ def skill_name(f, fallback):
     """A skill's invocation name: its frontmatter `name`, under any key quoting (Claude Code uses it in place of the
     folder name), else the folder name."""
     text = f.read_text(errors="ignore")
-    n = frontmatter(text).get("name")  # bare key, including folded block scalars
-    if n is None and (m := NAME_LINE_RE.search(raw_frontmatter(text))):  # a quoted "name" key
-        v = m.group(1).split(" #")[0].strip()
-        try:
-            n = json.loads(v) if v.startswith('"') else v.strip("'")  # double quotes may hold escapes
+    m = NAME_LINE_RE.search(raw_frontmatter(text))
+    v = m.group(1).strip() if m else ""
+    if v.startswith('"'):
+        try:  # double quotes may hold escapes, as YAML reads them
+            n = json.loads(v[:v.rindex('"') + 1])
         except ValueError:
             n = None
+    elif v.startswith("'"):
+        n = v[1:v.rindex("'")] if v.count("'") > 1 else None
+    elif not v or v[0] in ">|":
+        n = frontmatter(text).get("name")  # folded or literal block scalar
+    else:
+        n = v.split(" #")[0].strip()  # plain scalar, minus a trailing comment
     return n if safe_name(n) else fallback
 
 
@@ -362,8 +368,11 @@ def plain_frontmatter(text, kind):
     if "\\" in raw or (raw and not raw.endswith("\n")) or not closes_on_own_line:
         return False
     keys = []
-    for ln in raw.splitlines():
-        if not ln.strip() or ln.lstrip().startswith("#") or ln[0] in " \t":
+    lines = [ln for ln in raw.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    if lines and lines[0][0] in " \t":
+        return False  # an indented root mapping: Scav's parser would read none of its keys
+    for ln in lines:
+        if ln[0] in " \t":
             continue  # blank, comment, or nested under a top-level key
         if not TOP_KEY_RE.fullmatch(ln):
             return False  # quoted, tagged, anchored, flow or explicit (?) key
@@ -396,7 +405,7 @@ def safe_frontmatter(text, kind, name):
     fm = frontmatter(head)
     out = [] if kind == "command" else [f"name: {yaml_str(name)}"]
     out += [f"{k}: {yaml_str(fm[k])}" for k in SAFE_KEYS[kind] if fm.get(k)]
-    if kind == "agent" and agent_tools(fm):
+    if kind == "agent" and "tools" in fm:  # `tools: ""` means none; leaving it out would grant them all
         out.append("tools: " + yaml_str(", ".join(agent_tools(fm))))
     return "---\n" + "\n".join(out) + "\n---\n" + inert(body)
 
@@ -845,8 +854,9 @@ def copy_component(c, dest, n, renames):
             text = re.sub(r"^name:.*$", f"name: {n}", text, count=1, flags=re.M)
         md.write_text(text)
     if c.get("pid", "").startswith("github:") and c["kind"] == "skill":  # relink vendored more files into _ext/
-        for f in (dest / rel / "_ext").rglob("*"):
-            if f.suffix.lower() == ".md" and f.is_file() and not f.is_symlink():
+        inside = (dest / rel).resolve()
+        for f in (dest / rel / "_ext").rglob("*"):  # a linked _ext (or dir under it) must not lead outside Scav
+            if f.suffix.lower() == ".md" and f.is_file() and f.resolve().is_relative_to(inside) and not f.is_symlink():
                 f.write_text(inert(f.read_text(errors="ignore")))
     return rel
 
