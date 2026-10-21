@@ -766,3 +766,602 @@ def test_eval_mcp_needs_run_servers_and_writes_no_row_when_the_server_never_conn
     row = scav.eval_history()[-1]
     assert (row["baseline"], row["judge"], row["fired"]) == ("no-server", "sonnet", "1/1")
     assert list(row["per_case"].values())[0]["pair"] == [1.0]
+
+
+def test_apply_recovers_from_an_interrupted_apply(tmp_path, monkeypatch):
+    monkeypatch.setattr(scav, "STATE", tmp_path / "state")
+    claude, dest = tmp_path / "claude", tmp_path / "scavsrc"
+    p = make_plugin(tmp_path / "cache", "p", {"skills/a/SKILL.md": "---\nname: a\ndescription: alpha\n---\n",
+                                              "skills/b/SKILL.md": "---\nname: b\ndescription: beta\n---\n"})
+    (claude / "plugins").mkdir(parents=True)
+    (claude / "plugins/installed_plugins.json").write_text(json.dumps({"plugins": {"p@m": [{"installPath": str(p)}]}}))
+    make_plugin(tmp_path, "scavsrc", {".claude-plugin/plugin.json": json.dumps({"name": "scav", "version": "0.1.0"})})
+    sel = tmp_path / "sel.json"
+    sel.write_text(json.dumps({"keep": ["skill:p:a"]}))
+    scav.apply(sel, claude=claude, dest=dest)
+    (dest / "skills/b").mkdir()  # copied before the interruption, never recorded in the manifest
+    (dest / "skills/b/stale.md").write_text("old")
+    sel.write_text(json.dumps({"keep": ["skill:p:a", "skill:p:b"]}))
+    scav.apply(sel, claude=claude, dest=dest)
+    assert sorted(f.name for f in (dest / "skills/b").iterdir()) == ["SKILL.md"]
+
+
+def test_malformed_plugin_configs_are_skipped_not_fatal(tmp_path, monkeypatch):
+    monkeypatch.setattr(scav, "STATE", tmp_path / "state")
+    claude, cache = tmp_path / "claude", tmp_path / "cache"
+    plugins = {"good": {"skills/a/SKILL.md": "---\nname: a\ndescription: alpha\n---\n"},
+               "m": {".mcp.json": json.dumps({"mcpServers": []})},
+               "h": {"hooks/hooks.json": json.dumps({"hooks": {"Stop": [{"hooks": "x"}], "Pre": {"hooks": []},
+                                                               "Post": [{"hooks": [{"type": "command", "command": "ok.sh"}, 3]}]}})},
+               "s": {".mcp.json": json.dumps({"mcpServers": {"bad": "x", "fine": {"command": "srv"}}})},
+               "j": {".claude-plugin/plugin.json": "[]", "skills/j/SKILL.md": "---\nname: j\ndescription: jay\n---\n"},
+               "n": {".mcp.json": json.dumps({"mcpServers": {"srv": {"command": "run", "args": None}}})},
+               "c": {"hooks/hooks.json": json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": []},
+                                                                                {"type": "command"}]}]}})}}
+    for name, files in plugins.items():
+        make_plugin(cache, name, files)
+    (claude / "plugins").mkdir(parents=True)
+    (claude / "plugins/installed_plugins.json").write_text(json.dumps({"plugins": {
+        f"{n}@m": [{"installPath": str(cache / n)}] for n in plugins}}))
+    ids = {c["id"] for c in scav.inventory(claude)}
+    assert ids == {"skill:good:a", "hook:h:all", "mcp:s:fine", "skill:j:j", "mcp:n:srv"}
+    sel = tmp_path / "sel.json"
+    sel.write_text(json.dumps({"keep": sorted(ids)}))
+    make_plugin(tmp_path, "scavsrc", {".claude-plugin/plugin.json": json.dumps({"name": "scav", "version": "0.1.0"})})
+    scav.apply(sel, claude=claude, dest=tmp_path / "scavsrc")  # every surviving entry ingests cleanly
+    events = scav.plugin_config(cache / "h", "hooks", "hooks/hooks.json")[0]
+    assert events == {"Post": [{"hooks": [{"type": "command", "command": "ok.sh"}]}]}
+
+
+def test_mcp_tool_names_with_double_underscores_keep_their_server_prefix():
+    assert scav.mcp_prefix("mcp__plugin_p_srv__do__thing") == "mcp__plugin_p_srv"
+    assert scav.mcp_prefix("mcp__plugin_p_srv__read") == "mcp__plugin_p_srv"
+    assert scav.mcp_prefix("mcp__srv__read") is None
+
+
+def test_apply_never_writes_through_a_symlinked_markdown_file(tmp_path):
+    outside = tmp_path / "user-notes.md"
+    outside.write_text("notes about ${CLAUDE_PLUGIN_ROOT} and p:a\n")
+    src = make_plugin(tmp_path / "cache", "p", {"skills/a/SKILL.md": "---\nname: a\ndescription: alpha\n---\n"})
+    (src / "skills/a/notes.md").symlink_to(outside)
+    c = {"id": "skill:p:a", "kind": "skill", "plugin": "p", "name": "a", "path": str(src / "skills/a"), "root": str(src)}
+    scav.copy_component(c, tmp_path / "dest", "p-a", {"p:a": "scav:p-a"})
+    copy = tmp_path / "dest/skills/p-a/notes.md"
+    assert outside.read_text() == "notes about ${CLAUDE_PLUGIN_ROOT} and p:a\n"
+    assert not copy.is_symlink() and copy.read_text() == f"notes about {src} and scav:p-a\n"
+
+
+def test_apply_refuses_clashing_names_before_clearing_anything(tmp_path, monkeypatch):
+    monkeypatch.setattr(scav, "STATE", tmp_path / "state")
+    claude, cache, dest = tmp_path / "claude", tmp_path / "cache", tmp_path / "scavsrc"
+    for name, skill in (("a", "x"), ("b", "x"), ("c", "a-x")):
+        make_plugin(cache, name, {f"skills/{skill}/SKILL.md": f"---\nname: {skill}\ndescription: d\n---\n"})
+    (claude / "plugins").mkdir(parents=True)
+    (claude / "plugins/installed_plugins.json").write_text(json.dumps({"plugins": {
+        f"{n}@m": [{"installPath": str(cache / n)}] for n in "abc"}}))
+    make_plugin(tmp_path, "scavsrc", {".claude-plugin/plugin.json": json.dumps({"name": "scav", "version": "0.1.0"})})
+    sel = tmp_path / "sel.json"
+    sel.write_text(json.dumps({"keep": ["skill:a:x"]}))
+    scav.apply(sel, claude=claude, dest=dest)
+    sel.write_text(json.dumps({"keep": ["skill:a:x", "skill:b:x", "skill:c:a-x"]}))
+    try:
+        scav.apply(sel, claude=claude, dest=dest)
+        assert False, "clash not refused"
+    except SystemExit as e:
+        assert "clash" in str(e)
+    assert (dest / "skills/x/SKILL.md").exists()  # the previous apply is untouched
+
+
+def test_restore_reenables_every_disabled_source_and_keeps_failures(tmp_path, monkeypatch):
+    monkeypatch.setattr(scav, "STATE", tmp_path / "state")
+    claude, dest = tmp_path / "claude", tmp_path / "scavsrc"
+    p = make_plugin(tmp_path / "cache", "p", {"skills/a/SKILL.md": "---\nname: a\ndescription: alpha\n---\n"})
+    (claude / "plugins").mkdir(parents=True)
+    (claude / "plugins/installed_plugins.json").write_text(json.dumps({"plugins": {"p@m": [{"installPath": str(p)}]}}))
+    make_plugin(tmp_path, "scavsrc", {".claude-plugin/plugin.json": json.dumps({"name": "scav", "version": "0.1.0"})})
+    sel = tmp_path / "sel.json"
+    for disable in (["a@m"], ["b@m"]):
+        sel.write_text(json.dumps({"keep": ["skill:p:a"], "disable": disable}))
+        scav.apply(sel, claude=claude, dest=dest)
+    enabled = []
+    def fake_run(cmd, **kw):
+        enabled.append(cmd[-1])
+        return subprocess.CompletedProcess(cmd, 1 if cmd[-1] == "b@m" else 0)
+    monkeypatch.setattr(scav.subprocess, "run", fake_run)
+    try:
+        scav.restore()
+        assert False, "failed re-enable not reported"
+    except SystemExit as e:
+        assert "b@m" in str(e)
+    assert enabled == ["a@m", "b@m"] and scav.load_manifest()["disable"] == ["b@m"]
+    assert not (dest / "skills/a").exists()
+
+
+def test_failed_judge_calls_are_no_evidence():
+    res = {"cases": [{"name": "cal-k1", "promptMarkdown": "q", "arms": {"with": [judged("a")], "without": [judged("b")]}}]}
+    assert scav.pairwise(res, "haiku", ask=lambda *a: None) == {}
+    assert scav.pairwise(res, "haiku", ask=lambda *a: "tie") == {"k1": [0.0]}
+
+
+def test_lookalikes_only_compare_on_the_same_model_and_judge():
+    rows = CAL_OK + [mkrow("x:big", "r1", [0.4] * 4, tok=300, group="g"),
+                     mkrow("x:small", "r1", [0.9, 0.85, 0.9, 0.95], tok=60, group="g", model="opus", judge="sonnet")]
+    assert scav.verdicts(rows, set())["x:big"]["verdict"] == "keep"
+
+
+def test_fixture_skips_a_diff_that_fails_after_the_commit_check(monkeypatch):
+    calls = iter(["/repo\n", "", None])  # rev-parse, cat-file, then show fails
+    monkeypatch.setattr(scav, "git", lambda *a: next(calls))
+    assert scav.fixture("review commit abcdef1 please", "/repo") is None
+
+
+def scav_setup(tmp_path, monkeypatch, plugins):
+    monkeypatch.setattr(scav, "STATE", tmp_path / "state")
+    claude, cache, dest = tmp_path / "claude", tmp_path / "cache", tmp_path / "scavsrc"
+    for name, files in plugins.items():
+        make_plugin(cache, name, files)
+    (claude / "plugins").mkdir(parents=True)
+    (claude / "plugins/installed_plugins.json").write_text(json.dumps({"plugins": {
+        f"{n}@m": [{"installPath": str(cache / n)}] for n in plugins}}))
+    make_plugin(tmp_path, "scavsrc", {".claude-plugin/plugin.json": json.dumps({"name": "scav", "version": "0.1.0"})})
+    return claude, dest, tmp_path / "sel.json"
+
+
+def test_apply_refuses_clashing_mcp_server_names(tmp_path, monkeypatch):
+    claude, dest, sel = scav_setup(tmp_path, monkeypatch, {
+        "a": {".mcp.json": json.dumps({"mcpServers": {"x": {"command": "ax"}, "b-x": {"command": "abx"}}})},
+        "b": {".mcp.json": json.dumps({"mcpServers": {"x": {"command": "bx"}}})}})
+    sel.write_text(json.dumps({"keep": ["mcp:a:x", "mcp:a:b-x", "mcp:b:x"]}))
+    try:
+        scav.apply(sel, claude=claude, dest=dest)
+        assert False, "clash not refused"
+    except SystemExit as e:
+        assert "b-x" in str(e)
+
+
+def test_an_interrupted_apply_is_fully_undone_by_restore(tmp_path, monkeypatch):
+    claude, dest, sel = scav_setup(tmp_path, monkeypatch, {"p": {
+        "skills/a/SKILL.md": "---\nname: a\ndescription: alpha\n---\n",
+        "hooks/hooks.json": json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "s.sh"}]}]}}),
+        ".mcp.json": json.dumps({"mcpServers": {"srv": {"command": "run", "env": None}}})}})
+    sel.write_text(json.dumps({"keep": ["skill:p:a", "hook:p:all", "mcp:p:srv"]}))
+    def boom(dest):
+        raise OSError("disk full")
+    monkeypatch.setattr(scav, "bump_version", boom)  # fails after every file is written
+    try:
+        scav.apply(sel, claude=claude, dest=dest)
+    except OSError:
+        pass
+    assert json.loads((dest / ".mcp.json").read_text())["mcpServers"]["srv"]["env"]["CLAUDE_PLUGIN_ROOT"]
+    monkeypatch.setattr(scav, "bump_version", lambda dest: None)
+    scav.restore()
+    assert not any((dest / rel).exists() for rel in ("skills/a", "hooks/hooks.json", ".mcp.json"))
+
+
+def test_vendoring_never_copies_through_a_linked_dir_in_the_skill(tmp_path):
+    user = tmp_path / "user"
+    user.mkdir()
+    src = make_plugin(tmp_path / "cache", "p", {"skills/a/SKILL.md": "---\nname: a\ndescription: d\n---\nsee ../../references/check.md\n",
+                                                "references/check.md": "checklist"})
+    (src / "skills/a/_ext").symlink_to(user)
+    c = {"id": "skill:p:a", "kind": "skill", "plugin": "p", "name": "a", "path": str(src / "skills/a"), "root": str(src)}
+    scav.copy_component(c, tmp_path / "dest", "a", {})
+    assert list(user.iterdir()) == []
+    assert str((src / "references/check.md").resolve()) in (tmp_path / "dest/skills/a/SKILL.md").read_text()
+
+
+def test_synced_plugin_with_a_non_object_manifest_is_skipped(tmp_path):
+    (tmp_path / "plugins").mkdir()
+    (tmp_path / "plugins/installed_plugins.json").write_text(json.dumps({"plugins": {}}))
+    pj = tmp_path / "plugins/synced/x/y/.claude-plugin/plugin.json"
+    pj.parent.mkdir(parents=True)
+    pj.write_text("[]")
+    assert scav.installed_plugins(tmp_path) == []
+
+
+def test_model_calls_stop_at_the_budget_cap(monkeypatch):
+    calls = []
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"total_cost_usd": 0.2, "structured_output": {"better": "A"}}))
+    monkeypatch.setattr(scav.subprocess, "run", fake_run)
+    monkeypatch.setitem(scav.SPEND, "usd", 0.0)
+    monkeypatch.setitem(scav.SPEND, "cap", 0.3)
+    assert [scav.ask_judge("q", "a", "b", "haiku") for _ in range(3)] == ["A", "A", None]
+    assert len(calls) == 2 and round(scav.SPEND["usd"], 2) == 0.4
+
+
+def test_a_plugin_whose_config_path_cannot_be_read_is_skipped(tmp_path, monkeypatch):
+    claude, dest, sel = scav_setup(tmp_path, monkeypatch, {
+        "good": {"skills/a/SKILL.md": "---\nname: a\ndescription: alpha\n---\n"},
+        "long": {".claude-plugin/plugin.json": json.dumps({"name": "long", "hooks": "x" * 300 + ".json"})}})
+    assert {c["id"] for c in scav.inventory(claude)} == {"skill:good:a"}
+
+
+def test_calibration_screening_counts_toward_the_budget(tmp_path, monkeypatch):
+    monkeypatch.setattr(scav, "STATE", tmp_path / "state")
+    (tmp_path / "claude/projects").mkdir(parents=True)
+    (tmp_path / "claude/plugins").mkdir()
+    (tmp_path / "claude/plugins/installed_plugins.json").write_text(json.dumps({"plugins": {}}))
+    monkeypatch.setattr(scav, "usage", lambda days, claude: ({}, [(f"2026-10-0{k}T00:00:00", "claude", f"s{k}",
+                                                               f"explain how bloom filters trade memory for false positives and when a cuckoo filter is the better pick, case {k}") for k in range(1, 5)]))
+    calls = []
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"total_cost_usd": 1.0, "structured_output": {"answerable": True}}))
+    monkeypatch.setattr(scav.subprocess, "run", fake_run)
+    scav.eval_components([], 0.01, limit=4, dry=True, calibrate=True, claude=tmp_path / "claude")
+    assert len(calls) == 1 and scav.SPEND["usd"] == 1.0
+
+
+def test_a_failed_manifest_write_keeps_the_previous_record(tmp_path, monkeypatch):
+    monkeypatch.setattr(scav, "STATE", tmp_path)
+    scav.save_manifest({"generated": ["skills/a"], "disable": ["a@m"]})
+    def broken(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(scav.os, "replace", broken)
+    try:
+        scav.save_manifest({"generated": ["skills/b"]})
+    except OSError:
+        pass
+    assert scav.load_manifest() == {"generated": ["skills/a"], "disable": ["a@m"]}
+
+
+def test_unsafe_plugin_names_never_become_paths_outside_scav(tmp_path, monkeypatch):
+    claude, dest, sel = scav_setup(tmp_path, monkeypatch, {})
+    pj = claude / "plugins/synced/x/y/.claude-plugin/plugin.json"
+    make_plugin(claude / "plugins/synced/x", "y", {".claude-plugin/plugin.json": json.dumps({"name": "../../victim"}),
+                                                   "skills/scav/SKILL.md": "---\nname: scav\ndescription: d\n---\n"})
+    victim = tmp_path / "victim-scav"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("mine")
+    sel.write_text(json.dumps({"keep": ["skill:../../victim:scav"]}))
+    try:
+        scav.apply(sel, claude=claude, dest=dest)
+        assert False, "unsafe name not refused"
+    except SystemExit as e:
+        assert "unknown" in str(e)  # never even discovered: Claude Code refuses such names too
+    scav.clear_generated(dest, {"generated": ["skills/../../victim-scav"]})  # an old manifest with such a path
+    assert (victim / "keep.txt").read_text() == "mine" and pj.exists()
+
+
+def test_a_skill_and_an_agent_with_one_name_both_keep_their_origin(tmp_path, monkeypatch):
+    claude, dest, sel = scav_setup(tmp_path, monkeypatch, {"p": {
+        "skills/x/SKILL.md": "---\nname: x\ndescription: s\n---\n", "agents/x.md": "---\nname: x\ndescription: a\n---\n"}})
+    sel.write_text(json.dumps({"keep": ["skill:p:x", "agent:p:x"]}))
+    scav.apply(sel, claude=claude, dest=dest)
+    origin = scav.load_manifest()["origin"]
+    assert sorted(origin.values()) == ["agent:p:x", "skill:p:x"]
+    for c in ({"id": "agent:p:x", "kind": "agent", "plugin": "p", "name": "x"},
+              {"id": "skill:p:x", "kind": "skill", "plugin": "p", "name": "x"}):
+        assert "scav:x" in scav.invoked_as(c, origin, False)
+
+
+def test_broken_registry_entries_and_unreadable_sources_are_skipped(tmp_path, monkeypatch):
+    claude, dest, sel = scav_setup(tmp_path, monkeypatch, {"good": {"skills/a/SKILL.md": "---\nname: a\ndescription: d\n---\n"}})
+    reg = json.loads((claude / "plugins/installed_plugins.json").read_text())
+    reg["plugins"].update({"empty@m": [], "nopath@m": [{"installPath": None}]})
+    (claude / "plugins/installed_plugins.json").write_text(json.dumps(reg))
+    monkeypatch.setattr(scav, "STATE", tmp_path / "state")
+    make_plugin(tmp_path / "state/github", "o__r", {".mcp.json": json.dumps({"mcpServers": {"bad": {"command": []}}}),
+                                                    "skills/s/SKILL.md": "---\nname: s\ndescription: d\n---\n"})
+    assert {c["id"] for c in scav.inventory(claude, all_fetched=True)} == {"skill:good:a", "skill:gh-o-r:s"}
+
+
+def test_names_clash_regardless_of_case_and_never_shadow_scav_itself(tmp_path, monkeypatch):
+    claude, dest, sel = scav_setup(tmp_path, monkeypatch, {
+        "p": {"commands/Scav.md": "---\ndescription: d\n---\n", "skills/Foo/SKILL.md": "---\nname: Foo\ndescription: d\n---\n"},
+        "q": {"skills/foo/SKILL.md": "---\nname: foo\ndescription: d\n---\n"}})
+    sel.write_text(json.dumps({"keep": ["command:p:Scav", "skill:p:Foo", "skill:q:foo"]}))
+    scav.apply(sel, claude=claude, dest=dest)
+    assert sorted(scav.load_manifest()["generated"]) == ["commands/p-Scav.md", "skills/p-Foo", "skills/q-foo"]
+
+
+def test_apply_refuses_linked_output_dirs_and_replaces_linked_files(tmp_path, monkeypatch):
+    claude, dest, sel = scav_setup(tmp_path, monkeypatch, {"p": {"skills/a/SKILL.md": "---\nname: a\ndescription: d\n---\n",
+                                                                 "agents/r.md": "---\nname: r\ndescription: d\n---\n"}})
+    user = tmp_path / "user"
+    (user / "a").mkdir(parents=True)
+    (user / "a/mine.md").write_text("mine")
+    (dest / "skills").symlink_to(user)
+    sel.write_text(json.dumps({"keep": ["skill:p:a"]}))
+    try:
+        scav.apply(sel, claude=claude, dest=dest)
+        assert False, "linked output dir not refused"
+    except SystemExit as e:
+        assert "symlink" in str(e)
+    assert (user / "a/mine.md").read_text() == "mine"
+    (dest / "skills").unlink()
+    (dest / "agents").mkdir()
+    (user / "r.md").write_text("mine")
+    (dest / "agents/r.md").symlink_to(user / "r.md")
+    sel.write_text(json.dumps({"keep": ["agent:p:r"]}))
+    scav.apply(sel, claude=claude, dest=dest)
+    assert (user / "r.md").read_text() == "mine" and not (dest / "agents/r.md").is_symlink()
+
+
+def test_a_failed_version_bump_leaves_valid_metadata(tmp_path, monkeypatch):
+    make_plugin(tmp_path, "d", {".claude-plugin/plugin.json": json.dumps({"name": "scav", "version": "0.1.0"})})
+    monkeypatch.setattr(scav.os, "replace", lambda *a: (_ for _ in ()).throw(OSError("disk full")))
+    try:
+        scav.bump_version(tmp_path / "d")
+    except OSError:
+        pass
+    assert json.loads((tmp_path / "d/.claude-plugin/plugin.json").read_text())["version"] == "0.1.0"
+
+
+def test_server_config_fills_the_root_into_strings_safely(tmp_path):
+    root = tmp_path / 'we"ird\\nroot'
+    make_plugin(tmp_path, root.name, {".mcp.json": json.dumps({"mcpServers": {"s": {
+        "command": "${CLAUDE_PLUGIN_ROOT}/srv", "args": ["--dir", "${CLAUDE_PLUGIN_ROOT}"], "env": None}}})})
+    cfg = scav.server_config({"root": str(root), "name": "s"})
+    assert cfg["command"] == f"{root}/srv" and cfg["args"] == ["--dir", str(root)]
+    assert cfg["env"] == {"CLAUDE_PLUGIN_ROOT": str(root)}
+
+
+def test_unusable_install_paths_and_unkeepable_fetched_agents_are_left_out(tmp_path, monkeypatch):
+    claude, dest, sel = scav_setup(tmp_path, monkeypatch, {"good": {"skills/a/SKILL.md": "---\nname: a\ndescription: d\n---\n"}})
+    reg = json.loads((claude / "plugins/installed_plugins.json").read_text())
+    reg["plugins"]["long@m"] = [{"installPath": "/" + "x" * 300}]
+    (claude / "plugins/installed_plugins.json").write_text(json.dumps(reg))
+    make_plugin(tmp_path / "state/github", "o__r", {
+        "skills/safe/SKILL.md": "---\nname: safe\ndescription: d\n---\n",
+        "agents/odd.md": "---\nname: odd\ndescription: d\ntools: {Read: yes}\n---\n"})
+    # an agent whose tool list can't be kept exactly is left out; hook stripping is tested on the copy
+    assert {c["id"] for c in scav.inventory(claude, all_fetched=True)} == {"skill:good:a", "skill:gh-o-r:safe"}
+
+
+def test_server_run_ignores_args_that_are_not_a_list():
+    assert scav.server_run({"command": "node", "args": 42}) == "node"
+
+
+def test_apply_and_restore_hold_the_state_lock(tmp_path, monkeypatch):
+    claude, dest, sel = scav_setup(tmp_path, monkeypatch, {"p": {"skills/a/SKILL.md": "---\nname: a\ndescription: d\n---\n"}})
+    held = []
+    monkeypatch.setattr(scav.fcntl, "flock", lambda f, op: held.append((Path(f.name).name, op)))
+    sel.write_text(json.dumps({"keep": ["skill:p:a"]}))
+    scav.apply(sel, claude=claude, dest=dest)
+    scav.restore()
+    assert held == [("lock", scav.fcntl.LOCK_EX)] * 2
+
+
+def test_declared_hooks_and_servers_merge_with_the_default_files(tmp_path):
+    hook = lambda cmd: {"hooks": [{"type": "command", "command": cmd}]}
+    root = make_plugin(tmp_path, "p", {
+        "hooks/hooks.json": json.dumps({"hooks": {"Stop": [hook("default.sh")]}}),
+        "extra.json": json.dumps({"hooks": {"Stop": [hook("extra.sh")], "PreToolUse": [hook("pre.sh")]}}),
+        ".mcp.json": json.dumps({"mcpServers": {"a": {"command": "a0"}, "b": {"command": "b0"}}}),
+        "more.json": json.dumps({"mcpServers": {"b": {"command": "b1"}}}),
+        ".claude-plugin/plugin.json": json.dumps({"name": "p",
+            "hooks": ["./extra.json", "./hooks/hooks.json", {"Stop": [hook("inline.sh")]}, "../outside.json"],
+            "mcpServers": ["./more.json", {"c": {"command": "c0"}}]})})
+    events = scav.plugin_config(root, "hooks", "hooks/hooks.json")[0]
+    assert [g["hooks"][0]["command"] for g in events["Stop"]] == ["default.sh", "extra.sh", "inline.sh"]
+    assert [g["hooks"][0]["command"] for g in events["PreToolUse"]] == ["pre.sh"]
+    servers = scav.plugin_config(root, "mcpServers", ".mcp.json")[0]
+    assert {k: v["command"] for k, v in servers.items()} == {"a": "a0", "b": "b1", "c": "c0"}
+
+
+def test_a_malformed_remote_hook_skips_that_hit_only(monkeypatch, capsys):
+    files = {("o/bad", ".claude-plugin/plugin.json"): json.dumps({"name": "bad", "description": "x"}),
+             ("o/bad", "hooks/hooks.json"): json.dumps({"hooks": {"PreToolUse": [{"matcher": ["Bash"], "hooks": [
+                 {"type": "command", "command": "evil.sh"}]}]}}),
+             ("o/good", ".mcp.json"): json.dumps({"mcpServers": {"srv": {"command": "node", "args": 42}}})}
+    def fake_gh(args):
+        if args[:2] == ["search", "code"]:
+            if "filename:plugin.json" in args:
+                return [{"repository": {"nameWithOwner": "o/bad"}, "path": ".claude-plugin/plugin.json"}]
+            if "filename:.mcp.json" in args:
+                return [{"repository": {"nameWithOwner": "o/good"}, "path": ".mcp.json"}]
+            return []
+        if args[1].startswith("repos/") and "/contents/" not in args[1]:
+            return {"stargazers_count": 1, "pushed_at": "2026-10-01T00:00:00Z"}
+        repo, path = args[1][len("repos/"):].split("/contents/")
+        if (repo, path) not in files:
+            raise RuntimeError("404")
+        import base64
+        return {"content": base64.b64encode(files[(repo, path)].encode()).decode()}
+    monkeypatch.setattr(scav, "gh_json", fake_gh)
+    rows = scav.github_entries("server tools", limit=4)
+    assert [(r["plugin"], r["kind"]) for r in rows] == [("o/good", "mcp")] and "node" in rows[0]["desc"]
+
+
+def test_pathologically_nested_config_is_skipped(tmp_path, monkeypatch):
+    claude, dest, sel = scav_setup(tmp_path, monkeypatch, {
+        "good": {"skills/a/SKILL.md": "---\nname: a\ndescription: d\n---\n"},
+        "deep": {".claude-plugin/plugin.json": '{"name": "deep", "hooks": ' + "[" * 100000 + "]" * 100000 + "}"}})
+    assert {c["id"] for c in scav.inventory(claude)} == {"skill:good:a"}
+
+
+def test_add_and_unpin_take_the_lock_once_even_though_add_applies(tmp_path, monkeypatch):
+    claude, dest, sel = scav_setup(tmp_path, monkeypatch, {"p": {"skills/a/SKILL.md": "---\nname: a\ndescription: d\n---\n"}})
+    held = []
+    monkeypatch.setattr(scav.fcntl, "flock", lambda f, op: held.append(op))
+    scav.add(["skill:p:a"], [], claude=claude, dest=dest)
+    scav.unpin(["skill:p:a"])
+    assert held == [scav.fcntl.LOCK_EX] * 2 and scav.load_pins() == set() and scav.HELD == []
+
+
+def test_held_components_whose_source_was_removed_are_dropped_with_a_warning(tmp_path, monkeypatch, capsys):
+    claude, dest, sel = scav_setup(tmp_path, monkeypatch, {"p": {"skills/a/SKILL.md": "---\nname: a\ndescription: d\n---\n"},
+                                                           "q": {"skills/b/SKILL.md": "---\nname: b\ndescription: d\n---\n"}})
+    sel.write_text(json.dumps({"keep": ["skill:p:a", "skill:q:b"]}))
+    scav.apply(sel, claude=claude, dest=dest)
+    reg = json.loads((claude / "plugins/installed_plugins.json").read_text())
+    del reg["plugins"]["q@m"]
+    (claude / "plugins/installed_plugins.json").write_text(json.dumps(reg))
+    scav.apply(sel, claude=claude, dest=dest)
+    assert "dropped, source no longer installed: skill:q:b" in capsys.readouterr().out
+    assert sorted(scav.load_manifest()["origin"].values()) == ["skill:p:a"]
+    sel.write_text(json.dumps({"keep": ["skill:p:a", "skill:q:typo"]}))
+    try:
+        scav.apply(sel, claude=claude, dest=dest)
+        assert False, "a never-held unknown id must still fail"
+    except SystemExit as e:
+        assert "skill:q:typo" in str(e)
+
+
+def test_declared_skill_agent_and_command_locations_are_scanned(tmp_path):
+    md = lambda n: f"---\nname: {n}\ndescription: {n} desc\n---\n"
+    root = make_plugin(tmp_path, "p", {
+        "skills/a/SKILL.md": md("a"), "extra/b/SKILL.md": md("b"), "solo/SKILL.md": md("solo"),
+        "agents/default.md": md("default"), "custom/rev.md": md("rev"),
+        "cmds/build.md": md("build"), "elsewhere/ship.md": md("ship"),
+        ".claude-plugin/plugin.json": json.dumps({"name": "p", "skills": ["./extra/", "./solo", "../out"],
+                                                   "agents": ["./custom/rev.md"],
+                                                   "commands": {"go": {"source": "./elsewhere/ship.md"}, "hi": {"content": "x"}}})})
+    ids = {c["id"] for c in scav.scan_plugin("p", "p@m", root, True)}
+    assert ids == {"skill:p:a", "skill:p:b", "skill:p:solo", "agent:p:rev", "command:p:go"}
+    (root / ".claude-plugin/plugin.json").write_text(json.dumps({"name": "p", "commands": ["./cmds/"]}))
+    assert {c["id"] for c in scav.scan_plugin("p", "p@m", root, True) if c["kind"] == "command"} == {"command:p:build"}
+    bare = make_plugin(tmp_path, "bare", {"SKILL.md": md("bare")})
+    assert [c["id"] for c in scav.scan_plugin("bare", "bare@m", bare, True)] == ["skill:bare:bare"]
+
+
+def test_mixed_hook_arrays_load_in_either_order(tmp_path):
+    hook = lambda cmd: {"hooks": [{"type": "command", "command": cmd}]}
+    root = make_plugin(tmp_path, "p", {"extra.json": json.dumps({"hooks": {"Stop": [hook("extra.sh")]}}),
+                                       ".claude-plugin/plugin.json": json.dumps({"name": "p",
+                                           "hooks": [{"Stop": [hook("inline.sh")]}, "./extra.json"]})})
+    events = scav.plugin_config(root, "hooks", "hooks/hooks.json")[0]
+    assert [g["hooks"][0]["command"] for g in events["Stop"]] == ["inline.sh", "extra.sh"]
+
+
+def test_deeply_nested_server_config_fills_the_root_without_recursion(tmp_path):
+    deep = "${CLAUDE_PLUGIN_ROOT}"
+    for _ in range(600):
+        deep = [deep]
+    root = make_plugin(tmp_path, "p", {".mcp.json": json.dumps({"mcpServers": {"s": {"command": "run", "args": deep}}})})
+    cfg = scav.server_config({"root": str(root), "name": "s"})
+    leaf = cfg["args"]
+    while isinstance(leaf, list):
+        leaf = leaf[0]
+    assert leaf == str(root)
+
+
+def test_dropped_ids_stay_dropped_on_the_next_apply(tmp_path, monkeypatch, capsys):
+    claude, dest, sel = scav_setup(tmp_path, monkeypatch, {"p": {"skills/a/SKILL.md": "---\nname: a\ndescription: d\n---\n"},
+                                                           "q": {"skills/b/SKILL.md": "---\nname: b\ndescription: d\n---\n"}})
+    sel.write_text(json.dumps({"keep": ["skill:p:a", "skill:q:b"]}))
+    scav.apply(sel, claude=claude, dest=dest)
+    reg = json.loads((claude / "plugins/installed_plugins.json").read_text())
+    q = reg["plugins"].pop("q@m")
+    (claude / "plugins/installed_plugins.json").write_text(json.dumps(reg))
+    scav.apply(sel, claude=claude, dest=dest)
+    scav.apply(sel, claude=claude, dest=dest)  # the selection still names it
+    assert scav.load_manifest()["gone"] == ["skill:q:b"]
+    reg["plugins"]["q@m"] = q
+    (claude / "plugins/installed_plugins.json").write_text(json.dumps(reg))
+    scav.apply(sel, claude=claude, dest=dest)  # source is back: held again
+    assert "skill:q:b" in scav.load_manifest()["origin"].values() and scav.load_manifest()["gone"] == []
+
+
+def test_restore_leaves_sources_the_user_had_turned_off(tmp_path, monkeypatch):
+    claude, dest, sel = scav_setup(tmp_path, monkeypatch, {"p": {"skills/a/SKILL.md": "---\nname: a\ndescription: d\n---\n"}})
+    (claude / "settings.json").write_text(json.dumps({"enabledPlugins": {"p@m": False, "q@m": True}}))
+    sel.write_text(json.dumps({"keep": ["skill:p:a"], "disable": ["p@m", "q@m"]}))
+    scav.apply(sel, claude=claude, dest=dest)
+    assert scav.load_manifest()["disable"] == ["q@m"]
+
+
+def test_pins_and_selection_survive_a_failed_write(tmp_path, monkeypatch):
+    monkeypatch.setattr(scav, "STATE", tmp_path)
+    scav.save_pins({"a"})
+    monkeypatch.setattr(scav.os, "replace", lambda *a: (_ for _ in ()).throw(OSError("disk full")))
+    try:
+        scav.save_pins({"a", "b"})
+    except OSError:
+        pass
+    assert scav.load_pins() == {"a"}
+
+
+def test_exec_form_hooks_are_ingested_without_a_shell_prefix(tmp_path, monkeypatch):
+    claude, dest, sel = scav_setup(tmp_path, monkeypatch, {"p": {"hooks/hooks.json": json.dumps({"hooks": {"Stop": [{"hooks": [
+        {"type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/check.js", 3]},
+        {"type": "command", "command": "sh ${CLAUDE_PLUGIN_ROOT}/s.sh"}]}]}})}})
+    sel.write_text(json.dumps({"keep": ["hook:p:all"]}))
+    scav.apply(sel, claude=claude, dest=dest)
+    exe, shell = json.loads((dest / "hooks/hooks.json").read_text())["hooks"]["Stop"][0]["hooks"]
+    root = str(tmp_path / "cache/p")
+    assert exe == {"type": "command", "command": "node", "args": [f"{root}/check.js", 3]}
+    assert shell["command"] == f"export CLAUDE_PLUGIN_ROOT='{root}'; sh {root}/s.sh"
+    c = {"root": root}
+    assert "hook:Stop:node" in scav.hook_keys(c) and f"hook:Stop:{shell['command']}" in scav.hook_keys(c)
+
+
+def test_command_map_names_with_separators_are_skipped(tmp_path):
+    root = make_plugin(tmp_path, "p", {"safe.md": "---\ndescription: d\n---\n", ".claude-plugin/plugin.json": json.dumps(
+        {"name": "p", "commands": {"../../../../victim": {"source": "./safe.md"}, "ok": {"source": "./safe.md"}}})})
+    assert [c["id"] for c in scav.scan_plugin("p", "p@m", root, True)] == ["command:p:ok"]
+
+
+def test_a_failed_eval_never_reads_a_stale_result(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(scav, "STATE", tmp_path / "state")
+    claude, pw, guard = mcp_and_hook_plugins(tmp_path)
+    (claude / "projects/p").mkdir(parents=True)
+    ask = "Take a screenshot of the example.com landing page and describe its header"
+    (claude / "projects/p/s.jsonl").write_text("\n".join(json.dumps(x) for x in [
+        {"type": "user", "timestamp": "2026-10-20T00:00:00Z", "sessionId": "s", "message": {"content": ask}},
+        {"type": "assistant", "timestamp": "2026-10-20T00:00:01Z", "message": {"content": [
+            {"type": "tool_use", "name": "mcp__plugin_pw_browser__take_screenshot", "input": {}}]}}]) + "\n")
+    monkeypatch.setattr(scav, "answerable", lambda t, model="sonnet", tools="": True)
+    monkeypatch.setattr(scav.time, "strftime", lambda fmt, *a: "2026-10-20T00-00-00")
+    monkeypatch.setattr(scav.os, "getpid", lambda: 7)
+    stale = tmp_path / "state/evals/2026-10-20T00-00-00-7/mcp__pw__browser/result.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text(json.dumps({"costUsd": 0, "cases": [{"name": "fired-x", "arms": {"with": [], "without": []}}]}))
+    monkeypatch.setattr(scav.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "boom"))
+    scav.eval_components(["mcp:pw:browser"], 1.0, days=3650, run_servers=True, claude=claude)
+    out = json.loads(capsys.readouterr().out)
+    assert "eval failed: boom" in out["notes"]["mcp:pw:browser"] and not scav.eval_history()
+
+
+def test_mcp_server_names_that_would_be_paths_are_skipped(tmp_path):
+    root = make_plugin(tmp_path, "p", {".mcp.json": json.dumps({"mcpServers": {
+        "../../../../victim": {"command": "x"}, "ok": {"command": "y"}}})})
+    assert [c["id"] for c in scav.scan_plugin("p", "p@m", root, True)] == ["mcp:p:ok"]
+
+
+def test_skills_are_named_by_frontmatter_name_like_claude_code(tmp_path, monkeypatch):
+    claude, dest, sel = scav_setup(tmp_path, monkeypatch, {"p": {
+        "skills/folder/SKILL.md": "---\nname: actual-name\ndescription: d\n---\n",
+        "skills/plain/SKILL.md": "---\ndescription: d\n---\n"}})
+    ids = {c["id"] for c in scav.inventory(claude)}
+    assert ids == {"skill:p:actual-name", "skill:p:plain"}
+    sel.write_text(json.dumps({"keep": sorted(ids)}))
+    scav.apply(sel, claude=claude, dest=dest)
+    assert (dest / "skills/actual-name/SKILL.md").exists()
+    uses = Counter({"p:actual-name": 7})
+    c = next(c for c in scav.inventory(claude) if c["name"] == "actual-name")
+    assert scav.uses_for(c, uses, scav.load_manifest()["origin"], True) == 7
+
+
+def test_fetched_components_are_copied_with_only_fields_scav_parsed(tmp_path, monkeypatch):
+    monkeypatch.setattr(scav, "STATE", tmp_path / "state")
+    tricks = ['hooks:\n  Stop:\n    - hooks: [{type: command, command: evil.sh}]', '"\\u0068ooks": {Stop: []}',
+              "!!str hooks: {Stop: []}", "? hooks\n: {Stop: []}", "allowed-tools: Bash(*)"]
+    files = {f"skills/s{k}/SKILL.md": f"\ufeff---  \nname: s{k}\ndescription: 'says: hi'\n{x}\n---\nBody {k}\n"
+             for k, x in enumerate(tricks)}
+    files["agents/spy.md"] = "---\nname: spy\ndescription: d\nmodel: sonnet\ntools:\n  - Read\n  - Bash(git:*)\nhooks: {Stop: []}\n---\nAgent body\n"
+    files["commands/go.md"] = "---\ndescription: d\nargument-hint: '[x]'\nhooks: {}\n---\nCommand body\n"
+    make_plugin(tmp_path / "state/github", "o__r", files)
+    dest = tmp_path / "dest"
+    for c in scav.github_components():
+        n = c["name"]
+        scav.copy_component(c, dest, n, {})
+        out = (dest / scav.component_rel(c["kind"], n) / "SKILL.md" if c["kind"] == "skill"
+               else dest / scav.component_rel(c["kind"], n)).read_text()
+        fm = out.split("---\n")[1]
+        assert "hooks" not in fm and "allowed-tools" not in fm and "\\" not in fm, (c["id"], out)
+    assert (dest / "skills/s0/SKILL.md").read_text() == '---\nname: "s0"\ndescription: "says: hi"\n---\nBody 0\n'
+    assert (dest / "agents/spy.md").read_text() == \
+        '---\nname: "spy"\ndescription: "d"\nmodel: "sonnet"\ntools: "Read, Bash(git:*)"\n---\nAgent body\n'
+    assert (dest / "commands/go.md").read_text() == '---\ndescription: "d"\nargument-hint: "[x]"\n---\nCommand body\n'
+
+
+def test_installed_components_keep_their_frontmatter(tmp_path):
+    src = make_plugin(tmp_path / "cache", "p", {"skills/a/SKILL.md": "---\nname: a\ndescription: d\nallowed-tools: Read\n---\nBody\n"})
+    c = {"id": "skill:p:a", "kind": "skill", "plugin": "p", "pid": "p@m", "name": "a", "path": str(src / "skills/a"), "root": str(src)}
+    scav.copy_component(c, tmp_path / "dest", "a", {})
+    assert "allowed-tools: Read" in (tmp_path / "dest/skills/a/SKILL.md").read_text()
+

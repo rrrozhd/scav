@@ -18,7 +18,7 @@
   scav.py eval --run-servers     also scores MCP servers (starts them, as you) against no server; hooks get usage only
   scav.py eval --calibrate       runs the controls that must pass before prune verdicts count
 """
-import argparse, base64, hashlib, json, math, os, random, re, shutil, statistics, subprocess, sys, time
+import argparse, base64, fcntl, hashlib, json, math, os, random, re, shutil, statistics, subprocess, sys, time
 from collections import Counter
 from pathlib import Path
 
@@ -61,14 +61,20 @@ def installed_plugins(claude=CLAUDE):
     out = []
     for pid, entries in data.items():
         name = pid.split("@")[0]
-        root = Path(entries[0]["installPath"])
-        if name != SELF and root.is_dir():
+        try:
+            root = Path(entries[0]["installPath"])
+            usable = root.is_dir()
+        except (IndexError, KeyError, TypeError, OSError):
+            continue  # a broken registry entry: skip that plugin, not every command
+        if name != SELF and usable:
             out.append((name, pid, root, bool(enabled.get(pid))))
     for pj in sorted((claude / "plugins/synced").glob("*/*/.claude-plugin/plugin.json")):
         try:
             name = json.loads(pj.read_text())["name"]
-        except (ValueError, KeyError):
+        except (ValueError, KeyError, TypeError, OSError, RecursionError):
             continue
+        if not safe_name(name) or name.startswith("."):
+            continue  # Claude Code refuses such names; here they would become paths
         pid = f"{name}@synced"
         out.append((name, pid, pj.parent.parent, enabled.get(pid, True) is not False))
     return out
@@ -79,23 +85,49 @@ def read_local(path):
 
 
 def plugin_config(root, key, default, read=read_local):
-    """(mapping, file) for a plugin's hooks ({event: groups}) or MCP servers ({name: config}). plugin.json's `key` wins:
-    a path relative to the plugin root, or an inline object. Otherwise the conventional file, if any.
-    `read(path)` returns a file's text or None; github_entries passes one that reads from GitHub."""
-    manifest = root / ".claude-plugin/plugin.json"
-    try:
-        val = json.loads(read(manifest) or "{}").get(key)
-    except ValueError:
-        val = None
-    src = manifest
-    if val is None or isinstance(val, str):
-        src = root / (val or default)
+    """(mapping, file) for a plugin's hooks ({event: groups}) or MCP servers ({name: config}). Like Claude Code, the
+    default file loads first, then what plugin.json declares under `key` merges in: a path relative to the plugin
+    root, an inline object, or an array of either (a later MCP name replaces an earlier one; hook groups add up).
+    `file` is the last source that contributed. `read(path)` returns a file's text or None; github_entries passes
+    one that reads from GitHub."""
+    def parse(text):
         try:
-            val = json.loads(read(src) or "{}")
-        except ValueError:
-            val = {}
-    # a file wraps the mapping in {"hooks": ...} / {"mcpServers": ...}; an inline object may not
-    return (val.get(key, val) if isinstance(val, dict) else {}), src
+            return json.loads(text or "{}")
+        except (ValueError, RecursionError):
+            return {}
+    manifest = root / ".claude-plugin/plugin.json"
+    declared = parse(read(manifest))
+    declared = declared.get(key) if isinstance(declared, dict) else None
+    sources = [root / default]
+    for d in declared if isinstance(declared, list) else [] if declared is None else [declared]:
+        if isinstance(d, str) and ".." not in Path(d).parts:  # Claude Code refuses paths that leave the plugin
+            if os.path.normpath(root / d) not in [os.path.normpath(s) for s in sources if isinstance(s, Path)]:
+                sources.append(root / d)
+        elif isinstance(d, dict):
+            sources.append(d)
+    merged, src = {}, root / default
+    for s in sources:
+        # a file wraps the mapping in {"hooks": ...} / {"mcpServers": ...}; an inline object doesn't
+        val = s if isinstance(s, dict) else parse(read(s))
+        m = (val.get(key, val) if isinstance(s, Path) else val) if isinstance(val, dict) else {}
+        if not isinstance(m, dict) or not m:
+            continue
+        src = manifest if isinstance(s, dict) else s
+        for k, v in m.items():
+            if key != "hooks":
+                merged[k] = v
+            elif isinstance(v, list):
+                merged.setdefault(k, []).extend(v)
+    # drop malformed entries here, so one broken plugin can't crash inventory or apply for all the others
+    if key == "hooks":
+        ok = lambda h: isinstance(h, dict) and isinstance(h.get("command", ""), str) and \
+            (h.get("type") != "command" or h.get("command"))
+        events = {e: [{**g, "hooks": [h for h in g["hooks"] if ok(h)]} for g in gs
+                      if isinstance(g, dict) and isinstance(g.get("hooks"), list) and isinstance(g.get("matcher", ""), str)]
+                  for e, gs in merged.items()}
+        events = {e: [g for g in gs if g["hooks"]] for e, gs in events.items()}
+        return {e: gs for e, gs in events.items() if gs}, src
+    return {k: v for k, v in merged.items() if isinstance(v, dict)}, src
 
 
 DESC_CAP = 400  # find divides overlap by sqrt(word count), so a long built description would rank itself down
@@ -106,7 +138,7 @@ def plugin_about(root):
     """(plugin.json description, README lines) for building hook and MCP descriptions."""
     try:
         about = json.loads(read_local(root / ".claude-plugin/plugin.json") or "{}").get("description", "")
-    except ValueError:
+    except (ValueError, AttributeError, RecursionError):
         about = ""
     readme = [re.sub(r"[#*`>|_\[\]]|\(http\S*\)", "", ln).strip() for ln in (read_local(root / "README.md") or "").splitlines()]
     return about, [ln for ln in readme if ln]
@@ -114,7 +146,8 @@ def plugin_about(root):
 
 def server_run(cfg):
     """What an MCP server config starts or calls: its command line or URL, as written."""
-    return cfg.get("url") or " ".join([cfg.get("command", ""), *map(str, cfg.get("args", []))]).strip()
+    args = cfg.get("args") if isinstance(cfg.get("args"), list) else []
+    return str(cfg.get("url") or " ".join(map(str, [cfg.get("command") or "", *args])).strip())
 
 
 def mcp_desc(name, cfg, about, readme):
@@ -157,23 +190,65 @@ def hook_desc(events, about, root, src=None, read=read_local):
     return f"hooks on {', '.join(on)}: {text} Scripts: {', '.join(scripts) or '-'}. {about}"[:DESC_CAP]
 
 
+def safe_name(n):
+    """Can a component name from a manifest or frontmatter become part of a path in apply and eval?"""
+    return isinstance(n, str) and bool(n) and "/" not in n and "\\" not in n and n not in (".", "..")
+
+
+def skill_name(f, fallback):
+    """A skill's invocation name: its frontmatter `name` (Claude Code uses it in place of the folder name), else the
+    folder name."""
+    n = frontmatter(f.read_text(errors="ignore")).get("name")
+    return n if safe_name(n) else fallback
+
+
 def scan_plugin(name, pid, root, enabled):
     comps = []
     def add(kind, cname, path, desc, tok=None):
         comps.append({"id": f"{kind}:{name}:{cname}", "kind": kind, "plugin": name, "pid": pid,
                       "name": cname, "path": str(path), "root": str(root), "enabled": enabled,
                       "desc": desc, "tok": max(1, (len(cname) + len(desc)) // 4) if tok is None else tok})
-    for f in sorted(root.glob("skills/*/SKILL.md")):
-        add("skill", f.parent.name, f.parent, frontmatter(f.read_text(errors="ignore")).get("description", ""))
+    try:
+        decl = json.loads(read_local(root / ".claude-plugin/plugin.json") or "{}")
+    except (ValueError, RecursionError):
+        decl = {}
+    decl = decl if isinstance(decl, dict) else {}
+    def paths(key):  # a declared path or array of paths; Claude Code refuses ones that leave the plugin
+        v = decl.get(key)
+        return [root / x for x in (v if isinstance(v, list) else [v]) if isinstance(x, str) and ".." not in Path(x).parts]
+    seen = set()
+    def add_md(kind, cname, f):
+        if not safe_name(cname):
+            return  # e.g. a command map key like ../../x: it would become a path in apply and eval
+        if f.is_file() and (kind, cname) not in seen:
+            seen.add((kind, cname))
+            desc = frontmatter(f.read_text(errors="ignore")).get("description", "")
+            add(kind, cname, f.parent if kind == "skill" else f, desc)
+    # skills: declared dirs add to skills/; each holds <name>/SKILL.md folders or is one folder with SKILL.md
+    if decl.get("skills") is None and not (root / "skills").is_dir() and (root / "SKILL.md").is_file():
+        add_md("skill", skill_name(root / "SKILL.md", name), root / "SKILL.md")  # a bare plugin that is one skill
+    for d in [root / "skills", *paths("skills")]:
+        for f in [d / "SKILL.md"] if (d / "SKILL.md").is_file() else sorted(d.glob("*/SKILL.md")):
+            add_md("skill", skill_name(f, f.parent.name if f.parent != root else name), f)
+    # agents and commands: declared paths replace the default dir; commands may also be a name -> {source} map
     for kind in ("agent", "command"):
-        for f in sorted(root.glob(f"{kind}s/*.md")):
-            add(kind, f.stem, f, frontmatter(f.read_text(errors="ignore")).get("description", ""))
+        declared = decl.get(f"{kind}s")
+        if kind == "command" and isinstance(declared, dict):  # inline `content` commands have no file to copy
+            files = [(k, root / v["source"]) for k, v in declared.items()
+                     if isinstance(v, dict) and isinstance(v.get("source"), str) and ".." not in Path(v["source"]).parts]
+        else:
+            where = paths(f"{kind}s") if declared is not None else [root / f"{kind}s"]
+            files = [(f.stem, f) for w in where for f in ([w] if w.suffix == ".md" else sorted(w.glob("*.md")))]
+        for cname, f in files:
+            add_md(kind, cname, f)
     events, hsrc = plugin_config(root, "hooks", "hooks/hooks.json")
     servers, msrc = plugin_config(root, "mcpServers", ".mcp.json")
     about, readme = plugin_about(root) if events or servers else ("", [])
     if events:
         add("hook", "all", hsrc, hook_desc(events, about, root, hsrc), tok=0)
     for srv, cfg in servers.items():
+        if not safe_name(srv):
+            continue
         add("mcp", srv, msrc, mcp_desc(srv, cfg if isinstance(cfg, dict) else {}, about, readme), tok=0)
     return comps
 
@@ -185,7 +260,13 @@ def inventory(claude=CLAUDE, all_fetched=False):
     if not all_fetched:
         held = set(load_manifest().get("origin", {}).values()) | load_pins()
         fetched = [c for c in fetched if c["id"] in held]
-    return [c for p in installed_plugins(claude) for c in scan_plugin(*p)] + fetched
+    comps = []
+    for p in installed_plugins(claude):
+        try:
+            comps += scan_plugin(*p)
+        except (AttributeError, TypeError, KeyError, ValueError, OSError, RecursionError) as e:  # one broken plugin can't hide the rest
+            print(f"skipped {p[1]}: unreadable config ({e!r})", file=sys.stderr)
+    return comps + fetched
 
 
 GITHUB = "github"  # ~/.scav/github/<owner>__<repo>: shallow clones made by `fetch`
@@ -194,23 +275,64 @@ REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 
 def github_components():
     """Skills, agents and commands of fetched GitHub repos, as inventory rows. Hooks and MCP servers are left out:
-    they run code as the user on every session, so an unreviewed repo never gets that far."""
+    they run code as the user on every session, so an unreviewed repo never gets that far. Frontmatter hooks, which
+    Claude Code registers when a skill or agent is invoked, are stripped when one is copied (safe_frontmatter)."""
     comps = []
     for d in sorted((STATE / GITHUB).glob("*__*")):
         owner, repo = d.name.split("__", 1)
         name = f"gh-{owner}-{repo}".lower()
-        rows = [c for c in scan_plugin(name, f"github:{owner}/{repo}", d, False) if c["kind"] in KINDS]
-        seen = {c["path"] for c in rows}
-        for f in sorted(d.rglob("SKILL.md")):  # bare skill repos keep SKILL.md anywhere, not only skills/*/
-            if ".git" in f.parts or str(f.parent) in seen:
-                continue
-            desc = frontmatter(f.read_text(errors="ignore")).get("description", "")
-            cname = f.parent.name if f.parent != d else repo.lower()
-            rows.append({"id": f"skill:{name}:{cname}", "kind": "skill", "plugin": name, "pid": f"github:{owner}/{repo}",
-                         "name": cname, "path": str(f.parent), "root": str(d), "enabled": False, "desc": desc,
-                         "tok": max(1, (len(cname) + len(desc)) // 4)})
+        try:
+            rows = [c for c in scan_plugin(name, f"github:{owner}/{repo}", d, False) if c["kind"] in KINDS]
+            seen = {c["path"] for c in rows}
+            for f in sorted(d.rglob("SKILL.md")):  # bare skill repos keep SKILL.md anywhere, not only skills/*/
+                if ".git" in f.parts or str(f.parent) in seen:
+                    continue
+                desc = frontmatter(f.read_text(errors="ignore")).get("description", "")
+                cname = skill_name(f, f.parent.name if f.parent != d else repo.lower())
+                rows.append({"id": f"skill:{name}:{cname}", "kind": "skill", "plugin": name,
+                             "pid": f"github:{owner}/{repo}", "name": cname, "path": str(f.parent), "root": str(d), "enabled": False, "desc": desc,
+                             "tok": max(1, (len(cname) + len(desc)) // 4)})
+            # an agent whose tool list can't be kept exactly is left out: dropping `tools` would widen its access
+            rows = [c for c in rows if c["kind"] != "agent"
+                    or agent_tools(frontmatter(read_local(Path(c["path"])) or "")) is not None]
+        except (AttributeError, TypeError, KeyError, ValueError, OSError, RecursionError) as e:
+            print(f"skipped fetched {owner}/{repo}: unreadable ({e!r})", file=sys.stderr)
+            continue
         comps += rows
     return comps
+
+
+SAFE_KEYS = {"skill": ("description", "argument-hint"), "command": ("description", "argument-hint"),
+             "agent": ("description", "model")}
+TOOL_RE = re.compile(r"[A-Za-z_][\w-]*(?:\([^()\n]*\))?")
+
+
+def agent_tools(fm):
+    """An agent's `tools` as a list of tool names, [] if it declares none, None if they can't be read exactly."""
+    v = fm.get("tools", "").strip()
+    if not v:
+        return []
+    items = v[2:].split(" - ") if v.startswith("- ") else v.strip("[]").split(",")  # block list or flow/comma list
+    items = [x.strip().strip("\"'") for x in items]
+    return items if all(TOOL_RE.fullmatch(x) for x in items) else None
+
+
+def safe_frontmatter(text, kind, name):
+    """A fetched component's frontmatter rebuilt from what Scav parsed itself: its name, description and a few inert
+    keys (an agent also keeps its exact tool list). Everything else it declared, hooks or allowed-tools in any YAML
+    spelling, is dropped rather than detected. The body after the original frontmatter is kept as it is."""
+    head = text.lstrip("\ufeff")
+    lines = head.split("\n")
+    body = head
+    if lines[0].strip() == "---":
+        end = next((i for i, ln in enumerate(lines[1:], 1) if ln.strip() == "---"), None)
+        body = "\n".join(lines[end + 1:]) if end else head  # unclosed: keep it all, it now sits below ours
+    fm = frontmatter(head)
+    out = [] if kind == "command" else [f"name: {json.dumps(name, ensure_ascii=False)}"]
+    out += [f"{k}: {json.dumps(fm[k], ensure_ascii=False)}" for k in SAFE_KEYS[kind] if fm.get(k)]
+    if kind == "agent" and agent_tools(fm):
+        out.append("tools: " + json.dumps(", ".join(agent_tools(fm)), ensure_ascii=False))
+    return "---\n" + "\n".join(out) + "\n---\n" + body
 
 
 def gh_json(args):
@@ -271,21 +393,19 @@ def github_entries(need, limit=8):
             continue  # filename: also matches .mcp.json.archived
         root = path.parent.parent if path.name == "plugin.json" else path.parent
         read = lambda p: texts[(repo, p)] if (repo, p) in texts else texts.setdefault((repo, p), gh_text(repo, str(p)))
-        try:
+        try:  # remote files are untrusted: one malformed hit is skipped, not the whole search
             about = json.loads(read(path) or "{}").get("description", "") if path.name == "plugin.json" else ""
-            servers, src = plugin_config(root, "mcpServers", ".mcp.json", read) if path.name == "plugin.json" else \
-                (json.loads(read(path) or "{}").get("mcpServers", {}), path)
-        except (ValueError, AttributeError):
-            continue
-        if isinstance(servers, dict) and servers:
-            runs = "; ".join(f"{k}: {server_run(v)}" for k, v in servers.items() if isinstance(v, dict))
-            row(repo, str(src), "mcp", ",".join(servers), f"runs {runs}. {about}"[:DESC_CAP])
-        events, src = plugin_config(root, "hooks", "hooks/hooks.json", read) if path.name == "plugin.json" else ({}, path)
-        if events:
-            cmds = {h.get("command") for gs in events.values() if isinstance(gs, list) for g in gs if isinstance(g, dict)
-                    for h in g.get("hooks", []) if h.get("command")}
-            row(repo, str(src), "hook", "all", f"runs {'; '.join(sorted(cmds))}. " +
-                hook_desc(events, about, root, src, read))
+            servers, src = plugin_config(root, "mcpServers", path.name if path.name == ".mcp.json" else ".mcp.json", read)
+            if servers:
+                runs = "; ".join(f"{k}: {server_run(v)}" for k, v in servers.items())
+                row(repo, str(src), "mcp", ",".join(servers), f"runs {runs}. {about}"[:DESC_CAP])
+            events, src = plugin_config(root, "hooks", "hooks/hooks.json", read) if path.name == "plugin.json" else ({}, path)
+            if events:
+                cmds = {h["command"] for gs in events.values() for g in gs for h in g["hooks"] if h.get("command")}
+                row(repo, str(src), "hook", "all", f"runs {'; '.join(sorted(cmds))}. " +
+                    hook_desc(events, about, root, src, read))
+        except (ValueError, AttributeError, TypeError, KeyError, RecursionError) as e:
+            print(f"github hit {repo}/{path} skipped: {e!r}", file=sys.stderr)
     return rows
 
 
@@ -324,7 +444,7 @@ def user_text(d):
 
 def mcp_prefix(name):
     """`mcp__plugin_<plugin>_<server>` for a plugin MCP tool's name, else None."""
-    return name.rsplit("__", 1)[0] if name.startswith("mcp__plugin_") and name.count("__") >= 2 else None
+    return "__".join(name.split("__", 2)[:2]) if name.startswith("mcp__plugin_") and name.count("__") >= 2 else None
 
 
 HOOK_OUTCOMES = {"hook_success": "ran", "hook_blocking_error": "blocked", "hook_non_blocking_error": "error"}
@@ -422,7 +542,7 @@ def invoked_as(c, origin, bare_unique):
     """Every name c may have been called by: qualified, its Scav alias, or its bare name when no other component shares it.
     An MCP server is called by its tools' prefix, a plugin's hooks by their (event, command) as configured or as
     ingested into Scav. Two plugins shipping the same hook command share its keys."""
-    aliases = {k for k, v in origin.items() if v == c["id"]}
+    aliases = {k.split("#")[0] for k, v in origin.items() if v == c["id"]}
     if c["kind"] == "mcp":
         return {f"mcp__plugin_{c['plugin']}_{c['name']}"} | aliases
     if c["kind"] == "hook":
@@ -439,7 +559,8 @@ def hook_keys(c):
         for g in groups if isinstance(groups, list) else []:
             for h in g.get("hooks", []) if isinstance(g, dict) else []:
                 if h.get("type") == "command" and h.get("command"):
-                    keys |= {f"hook:{event}:{h['command']}", f"hook:{event}:{ingested_command(h['command'], c['root'])}"}
+                    ingested = ingested_command(h["command"], c["root"], isinstance(h.get("args"), list))
+                    keys |= {f"hook:{event}:{h['command']}", f"hook:{event}:{ingested}"}
                     if h.get("statusMessage"):  # transcripts log a hook's status message in place of its command
                         keys.add(f"hook:{event}:{h['statusMessage']}")
     return keys
@@ -554,6 +675,17 @@ def load_manifest():
     return json.loads(p.read_text()) if p.exists() else {}
 
 
+def write_atomic(path, text):
+    """Write via a temp file and os.replace, so a failed write never leaves a truncated file behind."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def save_manifest(m):
+    write_atomic(STATE / "manifest.json", json.dumps(m, indent=2))
+
+
 def scav_source(claude=CLAUDE):
     """The Scav marketplace's source dir: installs copy from here, so ingest writes here, not into the cache."""
     try:
@@ -565,6 +697,8 @@ def scav_source(claude=CLAUDE):
 def clear_generated(dest, manifest):
     for rel in manifest.get("generated", []):
         p = dest / rel
+        if not p.parent.resolve().is_relative_to(Path(dest).resolve()):
+            continue  # a path that escapes Scav's dir is never Scav's to delete
         if p.is_dir() and not p.is_symlink():
             shutil.rmtree(p)
         elif p.exists() or p.is_symlink():
@@ -597,65 +731,108 @@ def relink(text, src_dir, root, vendor=None, md_dir=None):
             local = vendor / "_ext" / target.relative_to(Path(root).resolve())
         except ValueError:
             return str(target)  # outside the source plugin: nothing sensible to vendor
+        if any(p.is_symlink() for p in [local, *local.parents] if p.is_relative_to(vendor)):
+            return str(target)  # a link copied with the skill: copying through it would write outside Scav
         local.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(target, local)
         return os.path.relpath(local, md_dir)
     return REL_PATH.sub(fix, text)
 
 
+def component_rel(kind, n):
+    return f"skills/{n}" if kind == "skill" else f"{kind}s/{n}.md"
+
+
 def copy_component(c, dest, n, renames):
     """Copy one skill/agent/command into plugin dir `dest` as `n`, with paths fixed up. Returns its relative path."""
     root, src = c["root"], Path(c["path"])
+    rel = component_rel(c["kind"], n)
     if c["kind"] == "skill":
-        rel = f"skills/{n}"
+        if (dest / rel).is_symlink():
+            (dest / rel).unlink()
+        shutil.rmtree(dest / rel, ignore_errors=True)  # left over by an interrupted apply, so not in any manifest
         shutil.copytree(src, dest / rel, symlinks=True, ignore=shutil.ignore_patterns("node_modules", ".git"))
         mds = list((dest / rel).rglob("*.md"))
     else:
-        rel = f"{c['kind']}s/{n}.md"
         (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+        if (dest / rel).is_symlink():
+            (dest / rel).unlink()  # copy2 would write through it
         shutil.copy2(src, dest / rel)
         mds = [dest / rel]
     for md in mds:
+        if md.is_symlink():  # copytree keeps links; write a copy, never through the link
+            body = md.read_text(errors="ignore")
+            md.unlink()
+            md.write_text(body)
+        if not md.resolve().is_relative_to((dest / rel).resolve()):
+            continue  # inside a linked dir: the file belongs to its source
         src_dir = (src / md.relative_to(dest / rel)).parent if c["kind"] == "skill" else src.parent
         vendor = dest / rel if c["kind"] == "skill" else None
         text = relink(rewrite(md.read_text(errors="ignore"), root, renames), src_dir, root, vendor, md.parent)
-        if n != c["name"] and md.name in ("SKILL.md", f"{n}.md"):
+        main = md == (dest / rel / "SKILL.md" if c["kind"] == "skill" else dest / rel)
+        if main and c.get("pid", "").startswith("github:"):  # unreviewed repo: keep only fields Scav parsed itself
+            text = safe_frontmatter(text, c["kind"], n)
+        elif n != c["name"] and main:
             text = re.sub(r"^name:.*$", f"name: {n}", text, count=1, flags=re.M)
         md.write_text(text)
     return rel
 
 
+HELD = []  # non-empty while this process holds ~/.scav/lock
+
+
+def exclusive(fn):
+    """Run fn holding ~/.scav/lock: two applies, restores or pin edits interleaving could lose pins or leave output
+    no manifest tracks. Reentrant within the process, since add calls apply."""
+    def run(*args, **kwargs):
+        if HELD:
+            return fn(*args, **kwargs)
+        STATE.mkdir(exist_ok=True)
+        with open(STATE / "lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            HELD.append(lock)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                HELD.pop()
+    return run
+
+
+@exclusive
 def apply(selection_path, claude=CLAUDE, dest=None):
     sel = json.loads(Path(selection_path).read_text())
     comps = {c["id"]: c for c in inventory(claude, all_fetched=True)}
     pins = load_pins()
     stale_pins = pins - comps.keys()  # e.g. the source plugin was uninstalled; warn, don't block
     keep = set(sel.get("keep", [])) | (pins & comps.keys())
+    prior = load_manifest()
+    # held before (or dropped as gone before), source since removed
+    gone = (keep - comps.keys()) & (set(prior.get("origin", {}).values()) | set(prior.get("gone", [])))
+    keep -= gone
     missing = keep - comps.keys()
     if missing:
         sys.exit(f"unknown component ids: {sorted(missing)[:10]}")
     dest = Path(dest) if dest else scav_source(claude)
     STATE.mkdir(exist_ok=True)
-    prior = load_manifest()
-    clear_generated(dest, prior)
     # trials stay trials while kept unpinned; a selection that leaves one out drops it like any unpinned component
     trial = ((set(prior.get("trial", [])) | set(sel.get("trial", []))) & keep) - pins
 
     chosen = [comps[i] for i in sorted(keep)]
-    counts = Counter((c["kind"], c["name"]) for c in chosen if c["kind"] in KINDS)
-    newname = {c["id"]: f"{c['plugin']}-{c['name']}" if counts[(c["kind"], c["name"])] > 1 or c["name"] in RESERVED
-               else c["name"] for c in chosen if c["kind"] in KINDS}
+    counts = Counter((c["kind"], c["name"].lower()) for c in chosen if c["kind"] in KINDS)
+    prefixed = lambda c: counts[(c["kind"], c["name"].lower())] > 1 or c["name"].lower() in RESERVED
+    newname = {c["id"]: f"{c['plugin']}-{c['name']}" if prefixed(c) else c["name"] for c in chosen if c["kind"] in KINDS}
     renames = {f"{comps[i]['plugin']}:{comps[i]['name']}": f"{SELF}:{n}" for i, n in newname.items()}
-    generated, origin = [], {}
+    clash = [k for k, v in Counter((comps[i]["kind"], n.lower()) for i, n in newname.items()).items() if v > 1]
+    unsafe = [n for n in newname.values() if "/" in n or "\\" in n or n in (".", "..")]
+    if unsafe:  # names come from plugin manifests; one like ../../x must not become a path outside Scav
+        sys.exit(f"unsafe component names: {unsafe}")
+    origin = {}
+    for i, n in newname.items():  # a skill and an agent may share a name; each keeps its own origin key
+        origin[f"{SELF}:{n}" if f"{SELF}:{n}" not in origin else f"{SELF}:{n}#{comps[i]['kind']}"] = i
     warnings = [f"pinned but not installed: {i}" for i in sorted(stale_pins)]
+    warnings += [f"dropped, source no longer installed: {i}" for i in sorted(gone - stale_pins)]
 
-    for c in chosen:
-        if c["kind"] not in KINDS:
-            continue
-        n = newname[c["id"]]
-        generated.append(copy_component(c, dest, n, renames))
-        origin[f"{SELF}:{n}"] = c["id"]
-
+    # everything that can fail on a source's config happens before the previous apply is cleared
     hooks = {}
     for c in chosen:
         if c["kind"] == "hook":
@@ -663,47 +840,70 @@ def apply(selection_path, claude=CLAUDE, dest=None):
                 for g in groups:
                     for h in g.get("hooks", []):
                         if h.get("type") == "command":
-                            h["command"] = ingested_command(h["command"], c["root"])
+                            exec_form = isinstance(h.get("args"), list)
+                            h["command"] = ingested_command(h["command"], c["root"], exec_form)
+                            if exec_form:
+                                h["args"] = [rewrite(a, c["root"], {}) if isinstance(a, str) else a for a in h["args"]]
                     hooks.setdefault(event, []).append(g)
             origin[f"hooks.json:{c['plugin']}"] = c["id"]
-    if hooks:
-        (dest / "hooks").mkdir(exist_ok=True)
-        (dest / "hooks/hooks.json").write_text(json.dumps({"hooks": hooks}, indent=2))
-        generated.append("hooks/hooks.json")
-
     servers = {}
     for c in chosen:
         if c["kind"] == "mcp":
             n = c["name"] if c["name"] not in servers else f"{c['plugin']}-{c['name']}"
+            if n in servers:  # e.g. a:x and b:x, where b-x is also a server's own name
+                clash.append(("mcp", n))
+                continue
             servers[n] = server_config(c)
             origin[f"mcp__plugin_{SELF}_{n}"] = c["id"]  # the prefix its tools are called by, as invoked_as reads it
-    if servers:
-        (dest / ".mcp.json").write_text(json.dumps({"mcpServers": servers}, indent=2))
-        generated.append(".mcp.json")
+    if clash:  # e.g. a:x and b:x become a-x, which c:a-x already is; copying would overwrite one with another
+        sys.exit(f"ingested names clash: {clash}; leave one of them out")
 
-    bump_version(dest)
+    generated = [component_rel(comps[i]["kind"], n) for i, n in newname.items()]
+    generated += (["hooks/hooks.json"] if hooks else []) + ([".mcp.json"] if servers else [])
     settings = claude / "settings.json"
+    try:  # sources the user had turned off before Scav: restore must leave them off
+        already_off = {k for k, v in json.loads(settings.read_text()).get("enabledPlugins", {}).items() if v is False}
+    except (OSError, ValueError, AttributeError):
+        already_off = set()
     if settings.exists() and not prior:  # back up once per apply..restore cycle
         shutil.copy2(settings, STATE / "settings.pre-scav.json")
-    (STATE / "manifest.json").write_text(json.dumps(
+    linked = [r for r in ("skills", "agents", "commands", "hooks", "hooks/hooks.json", ".mcp.json")
+              if (dest / r).is_symlink()]
+    if linked:  # apply deletes and writes under these; through a link that would reach outside Scav
+        sys.exit(f"Scav output paths are symlinks: {linked}; replace them with plain dirs/files")
+    clear_generated(dest, prior)
+    save_manifest(
         {"applied_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "dest": str(dest), "generated": generated,
-         "origin": origin, "disable": sel.get("disable", []), "trial": sorted(trial)}, indent=2))
+         "origin": origin, "trial": sorted(trial), "gone": sorted(gone),
+         # every source disabled since the last restore, so restore re-enables all of them, not just the latest
+         "disable": sorted(set(prior.get("disable", [])) | (set(sel.get("disable", [])) - already_off))})
+    for i, n in newname.items():
+        copy_component(comps[i], dest, n, renames)
+    if hooks:
+        (dest / "hooks").mkdir(exist_ok=True)
+        (dest / "hooks/hooks.json").write_text(json.dumps({"hooks": hooks}, indent=2))
+    if servers:
+        (dest / ".mcp.json").write_text(json.dumps({"mcpServers": servers}, indent=2))
+    bump_version(dest)
     print(json.dumps({"ingested": len(origin), "hooks_from": [c["plugin"] for c in chosen if c["kind"] == "hook"],
                       "mcp": list(servers), "trial": sorted(trial),
                       "scav_always_on_tokens": sum(comps[i]["tok"] for i in keep if comps[i]["kind"] in KINDS),
                       "warnings": warnings}, indent=2))
 
 
-def ingested_command(cmd, root):
-    # hook scripts that read $CLAUDE_PLUGIN_ROOT must keep seeing their source plugin
-    return f"export CLAUDE_PLUGIN_ROOT='{root}'; " + rewrite(cmd, root, {})
+def ingested_command(cmd, root, exec_form=False):
+    """A hook command as Scav declares it. Shell form: scripts that read $CLAUDE_PLUGIN_ROOT must keep seeing their
+    source plugin, so it is exported first. Exec form (with `args`) runs no shell, so only the path is filled in.
+    shortcut: an exec-form script reading $CLAUDE_PLUGIN_ROOT from its environment sees Scav's root."""
+    return rewrite(cmd, root, {}) if exec_form else f"export CLAUDE_PLUGIN_ROOT='{root}'; " + rewrite(cmd, root, {})
 
 
 def server_config(c):
     """MCP server c's config with its plugin root filled in, as Scav (or an eval plugin) declares it."""
     cfg = plugin_config(Path(c["root"]), "mcpServers", ".mcp.json")[0][c["name"]]
-    cfg = json.loads(rewrite(json.dumps(cfg), c["root"], {}))
-    cfg.setdefault("env", {})["CLAUDE_PLUGIN_ROOT"] = c["root"]
+    root = json.dumps(c["root"])[1:-1]  # JSON-escaped, so a root with a quote or backslash stays one string
+    cfg = json.loads(json.dumps(cfg).replace("${CLAUDE_PLUGIN_ROOT}", root).replace("$CLAUDE_PLUGIN_ROOT", root))
+    cfg["env"] = {**(cfg.get("env") if isinstance(cfg.get("env"), dict) else {}), "CLAUDE_PLUGIN_ROOT": c["root"]}
     return cfg
 
 
@@ -716,9 +916,10 @@ def bump_version(dest):
             d = json.loads(p.read_text())
             major, minor, patch = get(d).get("version", "0.1.0").split(".")
             get(d)["version"] = f"{major}.{minor}.{int(patch) + 1}"
-            p.write_text(json.dumps(d, indent=2) + "\n")
+            write_atomic(p, json.dumps(d, indent=2) + "\n")
 
 
+@exclusive
 def restore():
     """Remove ingested components and re-enable the plugins Scav absorbed.
     Re-enables through the CLI rather than copying settings.pre-scav.json back, which would undo later settings edits."""
@@ -727,8 +928,10 @@ def restore():
         sys.exit("nothing to restore: no ~/.scav/manifest.json")
     clear_generated(Path(m["dest"]), m)
     bump_version(Path(m["dest"]))
-    for pid in m.get("disable", []):
-        subprocess.run(["claude", "plugin", "enable", pid], check=False)
+    failed = [pid for pid in m.get("disable", []) if subprocess.run(["claude", "plugin", "enable", pid]).returncode]
+    if failed:  # keep the manifest so a retry still knows what is disabled
+        save_manifest({**m, "generated": [], "origin": {}, "disable": failed})
+        sys.exit(f"ingested components removed, but could not re-enable {failed}; run restore again")
     (STATE / "manifest.json").unlink()
     print(f"restored: ingested components removed, re-enabled {m.get('disable', [])}; "
           f"full settings backup at {STATE / 'settings.pre-scav.json'}")
@@ -744,7 +947,7 @@ def load_pins():
 
 def save_pins(pins):
     STATE.mkdir(exist_ok=True)
-    (STATE / PINS).write_text(json.dumps(sorted(pins), indent=2))
+    write_atomic(STATE / PINS, json.dumps(sorted(pins), indent=2))
 
 
 def list_plugin(plugin, claude=CLAUDE):
@@ -757,6 +960,7 @@ def list_plugin(plugin, claude=CLAUDE):
         print(f"{c['id']}\t{c['tok']}\t{c['path']}\t{c['desc'][:200]}")
 
 
+@exclusive
 def add(ids, disable, claude=CLAUDE, dest=None, trial=False):
     """Pin ids so every later apply keeps them, merge them into the current selection, and apply.
     With `trial`, nothing is pinned: the ids are marked as trials, and the next /scav run drops them if unused."""
@@ -773,13 +977,14 @@ def add(ids, disable, claude=CLAUDE, dest=None, trial=False):
     sel["disable"] = sorted(set(sel.get("disable", [])) | set(disable))
     if trial:
         sel["trial"] = sorted(set(sel.get("trial", [])) | set(ids))
-    path.write_text(json.dumps(sel, indent=2))
+    write_atomic(path, json.dumps(sel, indent=2))
     apply(path, claude=claude, dest=dest)
     for alias, i in load_manifest()["origin"].items():
         if i in ids:
-            print(f"{i} loads as {alias}")
+            print(f"{i} loads as {alias.split('#')[0]}")
 
 
+@exclusive
 def unpin(ids):
     save_pins(load_pins() - set(ids))
     print(f"unpinned {ids}; they stay in Scav until the next /scav run drops them")
@@ -961,8 +1166,9 @@ def fixture(text, cwd=""):
         for repo in repos:
             if all(git("-C", repo, "cat-file", "-e", f"{h}^{{commit}}") is not None for h in (a, b) if h):
                 args = ["diff", f"{a}..{b}"] if b else ["show", "--format=commit %H%n%n%B", a]
-                parts.append(f"$ git {' '.join(args)}\n" + git("-C", repo, *args))
-                break
+                if (diff := git("-C", repo, *args)) is not None:
+                    parts.append(f"$ git {' '.join(args)}\n" + diff)
+                    break
     body = "\n".join(parts)
     return body if parts and len(body) <= FIXTURE_CAP else None
 
@@ -1136,22 +1342,30 @@ PAIR_SCHEMA = json.dumps({"type": "object", "properties": {"better": {"enum": ["
                           "required": ["better"]})
 
 
+SPEND = {"usd": 0.0, "cap": math.inf}  # every model call this process makes; eval caps it at --max-cost-usd
+
+
 def claude_json(system, text, schema, model):
-    """Structured output from one `claude -p` call with no tools and no user settings, or None."""
+    """Structured output from one `claude -p` call with no tools and no user settings, or None (also once SPEND is
+    over its cap: callers already treat None as a failed call)."""
+    if SPEND["usd"] >= SPEND["cap"]:
+        return None
     p = subprocess.run(["claude", "-p", "--model", model, "--tools", "", "--setting-sources", "", "--strict-mcp-config",
                         "--no-session-persistence", "--system-prompt", system, "--json-schema", schema,
                         "--output-format", "json"], input=text, capture_output=True, text=True)
     try:
-        return json.loads(p.stdout)["structured_output"]
-    except (ValueError, KeyError, TypeError):
+        out = json.loads(p.stdout)
+        SPEND["usd"] += out.get("total_cost_usd") or 0
+        return out["structured_output"]
+    except (ValueError, KeyError, TypeError, AttributeError):
         return None
 
 
 def ask_judge(request, a, b, judge):
-    """'A', 'B' or 'tie'. An unreadable verdict counts as no preference rather than failing the run."""
+    """'A', 'B' or 'tie', or None when the call failed or its verdict is unreadable."""
     text = (f"<request>\n{request}\n</request>\n\n<answer_A>\n{a}\n</answer_A>\n\n<answer_B>\n{b}\n</answer_B>\n\n"
             "Which answer better serves the request?")
-    return (claude_json(PAIR_SYSTEM, text, PAIR_SCHEMA, judge) or {}).get("better", "tie")
+    return (claude_json(PAIR_SYSTEM, text, PAIR_SCHEMA, judge) or {}).get("better")
 
 
 ANSWERABLE_SYSTEM = ("You screen user requests for an offline test. The assistant answering will have no files, no "
@@ -1199,8 +1413,10 @@ def pairwise(res, judge, ask=ask_judge):
         for w, wo in zip(withs, withouts):
             if not invoked(w):
                 continue
-            first = {"A": 1, "B": -1}.get(ask(request, answer(w), answer(wo), judge), 0)
-            second = {"A": -1, "B": 1}.get(ask(request, answer(wo), answer(w), judge), 0)
+            first, second = ask(request, answer(w), answer(wo), judge), ask(request, answer(wo), answer(w), judge)
+            if first is None or second is None:
+                continue  # a failed judge call (auth, rate limit) must not count as a tie toward prune
+            first, second = {"A": 1, "B": -1}.get(first, 0), {"A": -1, "B": 1}.get(second, 0)
             out.setdefault(case["name"].split("-", 1)[1], []).append((first + second) / 2)
     return out
 
@@ -1297,7 +1513,7 @@ def verdicts(rows, pins, min_prompts=MIN_PROMPTS, margin=MARGIN):
     cost = lambda i: by_id[i][-1]["tok"] + by_id[i][-1]["invoke_tok"]
     for ids in members.values():
         for m in ids:
-            for k in sorted((k for k in ids if cost(k) < cost(m)), key=cost):
+            for k in sorted((k for k in ids if cost(k) < cost(m) and setup[k] == setup[m]), key=cost):
                 pm, pk = pooled(by_id[m]), pooled(by_id[k])
                 diffs = [pm[x] - pk[x] for x in pm.keys() & pk.keys()]
                 if len(diffs) >= min_prompts and bounds(diffs)[1] < margin and out[m]["verdict"] != "prune":
@@ -1349,9 +1565,10 @@ def hook_report(c, tasks, comps):
 
 def eval_components(ids, budget, model=None, judge=None, runs=1, limit=6, days=365, dry=False, calibrate=False,
                     run_servers=False, claude=CLAUDE):
+    SPEND.update(usd=0.0, cap=budget)  # before anything screens a prompt
     comps = {c["id"]: c for c in inventory(claude)}
     origin = load_manifest().get("origin", {})
-    run = time.strftime("%Y-%m-%dT%H-%M-%S")
+    run = time.strftime("%Y-%m-%dT%H-%M-%S") + f"-{os.getpid()}"  # two evals in one second get their own dirs
     out_dir = STATE / "evals" / run
     tasks, (_, prompts) = fired_tasks(days, claude), usage(days, claude)
     if calibrate:
@@ -1368,13 +1585,12 @@ def eval_components(ids, budget, model=None, judge=None, runs=1, limit=6, days=3
         groups.setdefault(f"{comps[i]['kind']}:{comps[i]['name']}", []).append(comps[i])
     placebo = control_component("placebo", out_dir / "controls")
     placebo_runs = runs * (2 if "control:placebo" in ids else 1)  # judged against itself needs twice the runs
-    rows, notes, spent, baselines, hooks = [], {}, 0.0, {}, {}
+    rows, notes, baselines, hooks = [], {}, {}, {}
 
     def run_alone(c, cases, work, n):
         """`claude plugin eval` with c as the only plugin: (result or None, note). A skill or agent runs with no
         baseline arm (the placebo is its baseline); an MCP server runs against the no-plugin arm of the same eval,
         with its real server started and its tools granted."""
-        nonlocal spent
         (work / ".claude-plugin").mkdir(parents=True, exist_ok=True)
         (work / ".claude-plugin/plugin.json").write_text(json.dumps({"name": EVAL_PLUGIN, "version": "0.0.0"}))
         if c["kind"] == "mcp":
@@ -1383,11 +1599,13 @@ def eval_components(ids, budget, model=None, judge=None, runs=1, limit=6, days=3
             copy_component(c, work, c["name"], {})
         for case in cases:
             write_case(work / f"evals/{case['source']}-{case_key(case['prompt'])}", case["prompt"], c, c["name"])
-        if dry or spent >= budget:
+        if dry or SPEND["usd"] >= budget:
             return None, "" if dry else "; not run: budget spent"
         raw = work / "result.json"
+        raw.unlink(missing_ok=True)  # a stale result must never pass for this run's
         cmd = ["claude", "plugin", "eval", str(work), "--json", str(raw), "--no-publish",
-               "--trust-plugin", "--threshold", "0", "--runs", str(n), "--max-cost-usd", f"{budget - spent:.2f}"]
+               "--trust-plugin", "--threshold", "0", "--runs", str(n),
+               "--max-cost-usd", f"{budget - SPEND['usd']:.2f}"]
         if c["kind"] == "mcp":
             print(f"starting MCP server {c['name']} as you: {server_run(server_config(c))}", file=sys.stderr)
             cmd += ["--ablation", "with-without", "--allow-real-servers",
@@ -1400,7 +1618,7 @@ def eval_components(ids, budget, model=None, judge=None, runs=1, limit=6, days=3
         if not raw.exists():
             return None, f"; eval failed: {(p.stderr or p.stdout).strip()[-300:]}"
         res = json.loads(raw.read_text())
-        spent += res.get("costUsd", 0)
+        SPEND["usd"] += res.get("costUsd", 0)
         return res, ""
 
     for group, members in groups.items():
@@ -1459,7 +1677,7 @@ def eval_components(ids, budget, model=None, judge=None, runs=1, limit=6, days=3
     hist = eval_history()
     v = verdicts(hist, load_pins())
     ok, why = calibration(hist, model or "default", judge or "haiku")
-    print(json.dumps({"run": run, "dir": str(out_dir), "spent_usd": round(spent, 4),
+    print(json.dumps({"run": run, "dir": str(out_dir), "spent_usd": round(SPEND["usd"], 4),
                       "calibration": {"ok": ok, "detail": why}, "notes": notes,
                       "fired": {r["id"]: r["fired"] for r in rows},
                       "verdicts": {i: v[i] for i in ids if i in v}, "hooks": hooks}, indent=2))
@@ -1491,7 +1709,7 @@ def main():
     e.add_argument("--runs", type=int, default=1, help="runs per case per arm (later runs pool per prompt)")
     e.add_argument("--cases", type=int, default=6, help="max cases per component")
     e.add_argument("--days", type=int, default=365)
-    e.add_argument("--dry-run", action="store_true", help="write the cases, run nothing")
+    e.add_argument("--dry-run", action="store_true", help="write the cases, run no evals (uncached prompts are still screened by a model call)")
     e.add_argument("--calibrate", action="store_true", help="run the placebo/saboteur/partial controls instead (each vs the placebo)")
     e.add_argument("--run-servers", action="store_true", help="evaluate MCP servers: starts each one's real server, as you")
     args = ap.parse_args()
