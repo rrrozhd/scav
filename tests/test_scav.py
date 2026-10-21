@@ -1365,3 +1365,64 @@ def test_installed_components_keep_their_frontmatter(tmp_path):
     scav.copy_component(c, tmp_path / "dest", "a", {})
     assert "allowed-tools: Read" in (tmp_path / "dest/skills/a/SKILL.md").read_text()
 
+
+
+def test_fetched_copies_close_the_round_10_gaps(tmp_path, monkeypatch):
+    monkeypatch.setattr(scav, "STATE", tmp_path / "state")
+    make_plugin(tmp_path / "state/github", "o__r", {
+        "skills/low/skill.md": "---\nname: low\ndescription: d\nhooks: {Stop: []}\n---\nrun !`printf x` now\n",
+        "skills/up/SKILL.MD": "---\nname: up\ndescription: d\nhooks: {Stop: []}\n---\n```!\nprintf y\n```\n",
+        "skills/up/notes.md": "see !`id`\n",
+        "agents/quoted.md": '---\nname: quoted\ndescription: d\n"tools": [Read]\n---\n',
+        "agents/denied.md": "---\nname: denied\ndescription: d\ndisallowedTools: Bash\n---\n",
+        "agents/ok---x.md": "---\nname: ok---x\ndescription: d\ntools: Read\n---\nbody\n",
+        "skills/dash/SKILL.md": "---\nname: dash\ndescription: a ---- b\n---\nbody\n",
+        "skills/d---x/SKILL.md": "---\ndescription: plain\n---\nbody\n"})
+    comps = {c["id"]: c for c in scav.github_components()}
+    # tool limits that can't be kept exactly are left out, including ok---x: Claude Code cuts its header at name: ok
+    assert [i for i in comps if i.startswith("agent:")] == []
+    dest = tmp_path / "dest"
+    for c in comps.values():
+        scav.copy_component(c, dest, c["name"], {})
+    for n in ("low", "up"):
+        text = (dest / f"skills/{n}/SKILL.md").read_text()
+        assert scav.raw_frontmatter(text) == f'name: "{n}"\ndescription: "d"\n' and "!`" not in text and "```!" not in text
+    assert "!`" not in (dest / "skills/up/notes.md").read_text()
+    assert "skill:gh-o-r:dash" not in comps  # Claude Code would cut its header mid-line: not plain
+    dash = (dest / "skills/d---x/SKILL.md").read_text()  # Claude's cut reaches the end despite --- in the name
+    assert scav.raw_frontmatter(dash) == 'name: "d\\u002d\\u002d\\u002dx"\ndescription: "plain"\n'
+
+
+def test_quoted_name_keys_name_the_skill(tmp_path):
+    root = make_plugin(tmp_path, "p", {"skills/folder/SKILL.md": '---\n"name": actual-name\ndescription: d\n---\n'})
+    assert [c["id"] for c in scav.scan_plugin("p", "p@m", root, True)] == ["skill:p:actual-name"]
+
+
+def test_only_plain_fetched_frontmatter_is_admitted(tmp_path, monkeypatch):
+    monkeypatch.setattr(scav, "STATE", tmp_path / "state")
+    md = lambda n, extra: f"---\nname: {n}\ndescription: d\n{extra}---\nbody\n"
+    make_plugin(tmp_path / "state/github", "o__r", {
+        "agents/esc.md": md("esc", '"to\\u006fls": [Read]\n'),
+        "agents/plain.md": md("plain", "tools: Read, Grep\n"),
+        "skills/deny/SKILL.md": md("deny", "disallowed-tools: Bash\n"),
+        "commands/deny.md": "---\ndescription: d\ndisallowedTools: Bash\n---\nbody\n",
+        "skills/tag/SKILL.md": md("tag", "!!str hooks: {}\n"),
+        "skills/dup/SKILL.md": md("dup", "name: y\n"),
+        "skills/open/SKILL.md": "---\nname: open\ndescription: d\n",
+        "skills/ok/SKILL.md": md("ok", "hooks:\n  Stop: []\nallowed-tools: Bash\n"),
+        "skills/vend/SKILL.md": md("vend", "") + "see ../../references/check.md\n",
+        "references/check.md": "---\nhooks: {}\n---\nrun !`id`\n"})
+    comps = {c["id"]: c for c in scav.github_components()}
+    assert sorted(comps) == ["agent:gh-o-r:plain", "skill:gh-o-r:ok", "skill:gh-o-r:vend"]
+    dest = tmp_path / "dest"
+    for c in comps.values():
+        scav.copy_component(c, dest, c["name"], {})
+    assert scav.raw_frontmatter((dest / "skills/ok/SKILL.md").read_text()) == 'name: "ok"\ndescription: "d"\n'
+    vendored = (dest / "skills/vend/_ext/references/check.md").read_text()
+    assert "!`" not in vendored
+
+
+def test_quoted_and_folded_names_resolve_like_yaml(tmp_path):
+    root = make_plugin(tmp_path, "p", {"skills/a/SKILL.md": "---\nname: >-\n  folded-name\ndescription: d\n---\n",
+                                       "skills/b/SKILL.md": '---\n"name": "\\u0061ctual"\ndescription: d\n---\n'})
+    assert sorted(c["id"] for c in scav.scan_plugin("p", "p@m", root, True)) == ["skill:p:actual", "skill:p:folded-name"]

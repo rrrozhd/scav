@@ -195,10 +195,35 @@ def safe_name(n):
     return isinstance(n, str) and bool(n) and "/" not in n and "\\" not in n and n not in (".", "..")
 
 
+CLAUDE_FM_RE = re.compile(r"^---\s*\n([\s\S]*?)---\s*\n?")  # Claude Code 2.1.304's own frontmatter regex
+NAME_LINE_RE = re.compile(r"""^(?:"name"|'name'|name):[ \t]+(.*)$""", re.M)
+
+
+def raw_frontmatter(text):
+    """The frontmatter block exactly as Claude Code cuts it: its closing --- need not start a line."""
+    m = CLAUDE_FM_RE.match(text.lstrip("\ufeff"))
+    return m.group(1) if m else ""
+
+
+def skill_file(d):
+    """d's SKILL.md in any letter case (a case-insensitive filesystem loads skill.md too), or None."""
+    try:
+        return next((f for f in sorted(d.iterdir()) if f.name.lower() == "skill.md" and f.is_file()), None)
+    except OSError:
+        return None
+
+
 def skill_name(f, fallback):
-    """A skill's invocation name: its frontmatter `name` (Claude Code uses it in place of the folder name), else the
-    folder name."""
-    n = frontmatter(f.read_text(errors="ignore")).get("name")
+    """A skill's invocation name: its frontmatter `name`, under any key quoting (Claude Code uses it in place of the
+    folder name), else the folder name."""
+    text = f.read_text(errors="ignore")
+    n = frontmatter(text).get("name")  # bare key, including folded block scalars
+    if n is None and (m := NAME_LINE_RE.search(raw_frontmatter(text))):  # a quoted "name" key
+        v = m.group(1).split(" #")[0].strip()
+        try:
+            n = json.loads(v) if v.startswith('"') else v.strip("'")  # double quotes may hold escapes
+        except ValueError:
+            n = None
     return n if safe_name(n) else fallback
 
 
@@ -225,10 +250,11 @@ def scan_plugin(name, pid, root, enabled):
             desc = frontmatter(f.read_text(errors="ignore")).get("description", "")
             add(kind, cname, f.parent if kind == "skill" else f, desc)
     # skills: declared dirs add to skills/; each holds <name>/SKILL.md folders or is one folder with SKILL.md
-    if decl.get("skills") is None and not (root / "skills").is_dir() and (root / "SKILL.md").is_file():
-        add_md("skill", skill_name(root / "SKILL.md", name), root / "SKILL.md")  # a bare plugin that is one skill
+    if decl.get("skills") is None and not (root / "skills").is_dir() and (f := skill_file(root)):
+        add_md("skill", skill_name(f, name), f)  # a bare plugin that is one skill
     for d in [root / "skills", *paths("skills")]:
-        for f in [d / "SKILL.md"] if (d / "SKILL.md").is_file() else sorted(d.glob("*/SKILL.md")):
+        subs = [skill_file(x) for x in sorted(d.iterdir()) if x.is_dir()] if d.is_dir() else []
+        for f in [own] if (own := skill_file(d)) else [x for x in subs if x]:
             add_md("skill", skill_name(f, f.parent.name if f.parent != root else name), f)
     # agents and commands: declared paths replace the default dir; commands may also be a name -> {source} map
     for kind in ("agent", "command"):
@@ -284,7 +310,8 @@ def github_components():
         try:
             rows = [c for c in scan_plugin(name, f"github:{owner}/{repo}", d, False) if c["kind"] in KINDS]
             seen = {c["path"] for c in rows}
-            for f in sorted(d.rglob("SKILL.md")):  # bare skill repos keep SKILL.md anywhere, not only skills/*/
+            # bare skill repos keep SKILL.md anywhere, not only skills/*/, and in any letter case
+            for f in sorted(x for x in d.rglob("*") if x.name.lower() == "skill.md" and x.is_file()):
                 if ".git" in f.parts or str(f.parent) in seen:
                     continue
                 desc = frontmatter(f.read_text(errors="ignore")).get("description", "")
@@ -292,9 +319,9 @@ def github_components():
                 rows.append({"id": f"skill:{name}:{cname}", "kind": "skill", "plugin": name,
                              "pid": f"github:{owner}/{repo}", "name": cname, "path": str(f.parent), "root": str(d), "enabled": False, "desc": desc,
                              "tok": max(1, (len(cname) + len(desc)) // 4)})
-            # an agent whose tool list can't be kept exactly is left out: dropping `tools` would widen its access
-            rows = [c for c in rows if c["kind"] != "agent"
-                    or agent_tools(frontmatter(read_local(Path(c["path"])) or "")) is not None]
+            # only plain frontmatter is copied (plain_frontmatter): anything Scav can't read exactly is left out
+            rows = [c for c in rows if plain_frontmatter(read_local(
+                skill_file(Path(c["path"])) if c["kind"] == "skill" else Path(c["path"])) or "", c["kind"])]
         except (AttributeError, TypeError, KeyError, ValueError, OSError, RecursionError) as e:
             print(f"skipped fetched {owner}/{repo}: unreadable ({e!r})", file=sys.stderr)
             continue
@@ -317,6 +344,45 @@ def agent_tools(fm):
     return items if all(TOOL_RE.fullmatch(x) for x in items) else None
 
 
+TOP_KEY_RE = re.compile(r"[A-Za-z][\w-]*:(?:[ \t].*)?")
+
+
+def plain_frontmatter(text, kind):
+    """May a fetched component be copied? Only if its frontmatter is plain YAML that Scav reads exactly as Claude Code
+    does: bare top-level keys, no backslash (escapes can spell any key), no duplicate key, and a closing --- on its own
+    line (Claude Code cuts at the first --- anywhere). It must also lose no restriction when rebuilt: no
+    disallowed-tools, and an agent's tools must parse exactly, since an agent without `tools` gets them all.
+    Anything else is left out rather than second-guessed."""
+    head = text.lstrip("\ufeff")
+    m = CLAUDE_FM_RE.match(head)
+    if not m:
+        return not head.startswith("---")  # no frontmatter at all is plain; an unclosed block is not
+    raw = m.group(1)
+    closes_on_own_line = re.match(r"---[ \t]*(?:\r?\n|$)", head[m.start(1) + len(raw):])
+    if "\\" in raw or (raw and not raw.endswith("\n")) or not closes_on_own_line:
+        return False
+    keys = []
+    for ln in raw.splitlines():
+        if not ln.strip() or ln.lstrip().startswith("#") or ln[0] in " \t":
+            continue  # blank, comment, or nested under a top-level key
+        if not TOP_KEY_RE.fullmatch(ln):
+            return False  # quoted, tagged, anchored, flow or explicit (?) key
+        keys.append(ln.split(":", 1)[0].lower())
+    if len(keys) != len(set(keys)) or {"disallowed-tools", "disallowedtools"} & set(keys):
+        return False
+    return kind != "agent" or agent_tools(frontmatter(head)) is not None
+
+
+def inert(text):
+    """Text with Claude Code's shell directives (!`cmd` and ```! blocks) broken the way Claude Code breaks them."""
+    return text.replace("`!", "` !").replace("!`", "! `")
+
+
+def yaml_str(v):
+    """A YAML double-quoted scalar with no run of dashes: Claude Code ends frontmatter at the first --- anywhere."""
+    return re.sub(r"-{3,}", lambda m: "\\u002d" * len(m.group()), json.dumps(v, ensure_ascii=False))
+
+
 def safe_frontmatter(text, kind, name):
     """A fetched component's frontmatter rebuilt from what Scav parsed itself: its name, description and a few inert
     keys (an agent also keeps its exact tool list). Everything else it declared, hooks or allowed-tools in any YAML
@@ -328,11 +394,11 @@ def safe_frontmatter(text, kind, name):
         end = next((i for i, ln in enumerate(lines[1:], 1) if ln.strip() == "---"), None)
         body = "\n".join(lines[end + 1:]) if end else head  # unclosed: keep it all, it now sits below ours
     fm = frontmatter(head)
-    out = [] if kind == "command" else [f"name: {json.dumps(name, ensure_ascii=False)}"]
-    out += [f"{k}: {json.dumps(fm[k], ensure_ascii=False)}" for k in SAFE_KEYS[kind] if fm.get(k)]
+    out = [] if kind == "command" else [f"name: {yaml_str(name)}"]
+    out += [f"{k}: {yaml_str(fm[k])}" for k in SAFE_KEYS[kind] if fm.get(k)]
     if kind == "agent" and agent_tools(fm):
-        out.append("tools: " + json.dumps(", ".join(agent_tools(fm)), ensure_ascii=False))
-    return "---\n" + "\n".join(out) + "\n---\n" + body
+        out.append("tools: " + yaml_str(", ".join(agent_tools(fm))))
+    return "---\n" + "\n".join(out) + "\n---\n" + inert(body)
 
 
 def gh_json(args):
@@ -752,7 +818,7 @@ def copy_component(c, dest, n, renames):
             (dest / rel).unlink()
         shutil.rmtree(dest / rel, ignore_errors=True)  # left over by an interrupted apply, so not in any manifest
         shutil.copytree(src, dest / rel, symlinks=True, ignore=shutil.ignore_patterns("node_modules", ".git"))
-        mds = list((dest / rel).rglob("*.md"))
+        mds = [f for f in (dest / rel).rglob("*") if f.suffix.lower() == ".md"]  # SKILL.MD loads on macOS too
     else:
         (dest / rel).parent.mkdir(parents=True, exist_ok=True)
         if (dest / rel).is_symlink():
@@ -769,12 +835,19 @@ def copy_component(c, dest, n, renames):
         src_dir = (src / md.relative_to(dest / rel)).parent if c["kind"] == "skill" else src.parent
         vendor = dest / rel if c["kind"] == "skill" else None
         text = relink(rewrite(md.read_text(errors="ignore"), root, renames), src_dir, root, vendor, md.parent)
-        main = md == (dest / rel / "SKILL.md" if c["kind"] == "skill" else dest / rel)
-        if main and c.get("pid", "").startswith("github:"):  # unreviewed repo: keep only fields Scav parsed itself
-            text = safe_frontmatter(text, c["kind"], n)
+        main = md.parent == dest / rel and md.name.lower() == "skill.md" if c["kind"] == "skill" else md == dest / rel
+        if c.get("pid", "").startswith("github:"):  # unreviewed repo: keep only fields Scav parsed, no shell lines
+            text = safe_frontmatter(text, c["kind"], n) if main else inert(text)
+            if main and c["kind"] == "skill" and md.name != "SKILL.md":
+                md.unlink()  # skill.md / SKILL.MD: written back under the one spelling every OS loads
+                md = md.with_name("SKILL.md")
         elif n != c["name"] and main:
             text = re.sub(r"^name:.*$", f"name: {n}", text, count=1, flags=re.M)
         md.write_text(text)
+    if c.get("pid", "").startswith("github:") and c["kind"] == "skill":  # relink vendored more files into _ext/
+        for f in (dest / rel / "_ext").rglob("*"):
+            if f.suffix.lower() == ".md" and f.is_file() and not f.is_symlink():
+                f.write_text(inert(f.read_text(errors="ignore")))
     return rel
 
 
@@ -1326,7 +1399,7 @@ def summarize(res, c, run, group, model, judge, explicit):
         src, key = case["name"].split("-", 1)
         per_case[key] = {"src": src, "fired": fired, "with": [r["score"] for r in withs],
                          "without": [r["score"] for r in withouts]}
-    src = Path(c["path"]) / "SKILL.md" if c["kind"] == "skill" else Path(c["path"]) if c["kind"] in KINDS else None
+    src = skill_file(Path(c["path"])) if c["kind"] == "skill" else Path(c["path"]) if c["kind"] in KINDS else None
     return {"id": c["id"], "run": run, "group": group, "model": model or "default", "judge": judge or "haiku",
             "explicit": explicit, "per_case": per_case, "fired": f"{fired_runs}/{with_runs}",
             "cost_with": mean(cw), "cost_without": mean(cwo), "tok": c["tok"],
